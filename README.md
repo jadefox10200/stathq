@@ -1,0 +1,2 @@
+# stathq
+Statistic HQ application
