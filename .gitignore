@@ -36,3 +36,12 @@ DS_Store
 log.txt
 stathq
 *.db
+
+# react
+*.log
+logs
+**/*.backup.*
+**/*.back.*
+
+node_modules
+bower_components

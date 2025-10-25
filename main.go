@@ -19,50 +19,304 @@ import (
 	"time"
 
 	"github.com/gocarina/gocsv"
-
+	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
+	"github.com/gorilla/sessions"
 	"github.com/jinzhu/now"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
 
+var (
+	store *sessions.CookieStore
+)
+
+// AuthMiddleware checks authentication and optionally role
+func AuthMiddleware(requireRole string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session, err := store.Get(r, "session-name")
+		if err != nil {
+			log.Printf("Session error: %v", err)
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+
+		userID, ok := session.Values["user_id"].(int)
+		if !ok || userID == 0 {
+			log.Printf("No user_id in session for %s", r.URL.Path)
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+
+		// Validate user and role
+		var companyID string
+		var username, role string
+		err = DB.QueryRow("SELECT c.company_id, u.username, u.role FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", userID).Scan(&companyID, &username, &role)
+		if err != nil {
+			log.Printf("User not found for id %d: %v", userID, err)
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+
+		if requireRole != "" && role != requireRole {
+			log.Printf("User %s (role %s) not authorized for %s (requires %s)", username, role, r.URL.Path, requireRole)
+			http.Error(w, `{"message": "Unauthorized"}`, http.StatusForbidden)
+			return
+		}
+
+		log.Printf("Authenticated user %s (company %s, role %s) accessing %s", username, companyID, role, r.URL.Path)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// UserInfoHandler returns the current user's information
+func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
+	session, err := store.Get(r, "session-name")
+	if err != nil {
+		log.Printf("Session error: %v", err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	userID, ok := session.Values["user_id"].(int)
+	if !ok || userID == 0 {
+		log.Printf("No user_id in session for %s", r.URL.Path)
+		http.Error(w, `{"message": "Unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	var companyID string
+	var username, role string
+	err = DB.QueryRow("SELECT c.company_id, u.username, u.role FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", userID).Scan(&companyID, &username, &role)
+	if err != nil {
+		log.Printf("User not found for id %d: %v", userID, err)
+		http.Error(w, `{"message": "Unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	response := map[string]string{
+		"company_id": companyID,
+		"username":   username,
+		"role":       role,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// LoginHandler handles login requests
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var creds struct {
+		CompanyID string `json:"company_id"`
+		Username  string `json:"username"`
+		Password  string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		log.Printf("Invalid login request: %v", err)
+		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Fetch user
+	var userID int
+	var hash, role string
+	err := DB.QueryRow(`
+		SELECT u.id, u.password_hash, u.role
+		FROM users u
+		JOIN companies c ON u.company_id = c.id
+		WHERE c.company_id = ? AND u.username = ?
+	`, creds.CompanyID, creds.Username).Scan(&userID, &hash, &role)
+	if err != nil {
+		log.Printf("Invalid credentials for %s/%s: %v", creds.CompanyID, creds.Username, err)
+		http.Error(w, `{"message": "Invalid credentials"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Compare password
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(creds.Password)); err != nil {
+		log.Printf("Password mismatch for %s/%s", creds.CompanyID, creds.Username)
+		http.Error(w, `{"message": "Invalid credentials"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Set session
+	session, _ := store.Get(r, "session-name")
+	session.Values["user_id"] = userID
+	if err := session.Save(r, w); err != nil {
+		log.Printf("Failed to save session: %v", err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Successful login for %s/%s (role %s)", creds.CompanyID, creds.Username, role)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "Login successful"}`)
+}
+
+// LogoutHandler clears the session
+func LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	session, err := store.Get(r, "session-name")
+	if err != nil {
+		log.Printf("Session error on logout: %v", err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Clear session
+	session.Values["user_id"] = 0
+	session.Options.MaxAge = -1
+	if err := session.Save(r, w); err != nil {
+		log.Printf("Failed to save session on logout: %v", err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("User logged out")
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "Logout successful"}`)
+}
+
+// RegisterHandler handles company signup
+func RegisterHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		CompanyID   string `json:"company_id"`
+		CompanyName string `json:"company_name"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Invalid register request: %v", err)
+		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	if err := RegisterCompany(req.CompanyID, req.CompanyName, req.Username, req.Password); err != nil {
+		log.Printf("Registration failed for %s/%s: %v", req.CompanyID, req.Username, err)
+		http.Error(w, `{"message": "Registration failed"}`, http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Registered company %s and admin %s", req.CompanyID, req.Username)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "Registration successful"}`)
+}
+
+// UserHandler handles creating new users (admin only)
+func UserHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		CompanyID string `json:"company_id"`
+		Username  string `json:"username"`
+		Password  string `json:"password"`
+		Role      string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Invalid user creation request: %v", err)
+		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	if err := RegisterUser(req.CompanyID, req.Username, req.Password, req.Role); err != nil {
+		log.Printf("User creation failed for %s/%s: %v", req.CompanyID, req.Username, err)
+		http.Error(w, `{"message": "User creation failed"}`, http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Created user %s (role %s) for company %s", req.Username, req.Role, req.CompanyID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "User created successfully"}`)
+}
+
 func main() {
-    f := CreateLog()
-    defer f.Close()
+	f := CreateLog()
+	defer f.Close()
 
-    InitDB() // Initialize SQLite
+	InitDB() // From db.go
 
-    port := ":9090"
+	// Initialize session store (use a secure key in production)
+	store = sessions.NewCookieStore([]byte("super-secret-key"))
+	store.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600 * 8, // 8 hours
+		HttpOnly: true,
+		Secure:   false, // Set to true in production with HTTPS
+	}
 
-    // API endpoints
-    // http.HandleFunc("/api/classifications", handleClassifications)
-    // http.HandleFunc("/api/divisions", handleDivisions)
-    // http.HandleFunc("/api/stats", handleStats)
-    http.HandleFunc("/services/getWeeklyStats", handleWeeklyStatsRequest)
-    http.HandleFunc("/services/getDailyStats", handleDailyStatsRequest)
-    http.HandleFunc("/services/save7R", handleSave7R)
-    http.HandleFunc("/services/saveWeeklyEdit", handleSaveWeeklyEdit)
-    http.HandleFunc("/services/logWeeklyStats", handleLogWeeklyStats)
+	// Create router
+	router := mux.NewRouter()
 
-    // Static file handlers
-    cssHandler := http.FileServer(http.Dir("public/css"))
-    http.Handle("/public/css/", http.StripPrefix("/public/css", addHeaders(cssHandler, "text/css", "public/css")))
+	// CORS middleware
+	corsMiddleware := handlers.CORS(
+		handlers.AllowedOrigins([]string{"http://localhost:3000"}),
+		handlers.AllowedMethods([]string{"GET", "POST", "OPTIONS"}),
+		handlers.AllowedHeaders([]string{"Content-Type"}),
+		handlers.AllowCredentials(),
+	)
 
-    jsHandler := http.FileServer(http.Dir("public/js"))
-    http.Handle("/public/js/", http.StripPrefix("/public/js", addHeaders(jsHandler, "application/javascript", "public/js")))
+	// Protected API endpoints
+	// router.Handle("/api/classifications", AuthMiddleware("", http.HandlerFunc(handleClassifications)))
+	// router.Handle("/api/divisions", AuthMiddleware("", http.HandlerFunc(handleDivisions)))
+	// router.Handle("/api/stats", AuthMiddleware("", http.HandlerFunc(handleStats)))
+	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleWeeklyStatsRequest)))
+	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleDailyStatsRequest)))
+	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
+	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
+	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
 
-    semanticHandler := http.FileServer(http.Dir("public/Semantic-UI-2.3.0/dist"))
-    http.Handle("/public/Semantic-UI-2.3.0/dist/", http.StripPrefix("/public/Semantic-UI-2.3.0/dist", addHeaders(semanticHandler, "", "public/Semantic-UI-2.3.0/dist")))
+	// Admin-only endpoint
+	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
 
-    videoHandler := http.FileServer(http.Dir("public/AV"))
-    http.Handle("/public/AV/", http.StripPrefix("/public/AV", addHeaders(videoHandler, "video/mp4", "public/AV")))
+	// User info endpoint
+	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
 
-    publicHandler := http.FileServer(http.Dir("public"))
-    http.Handle("/public/", http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
+	// Auth endpoints (unprotected)
+	router.HandleFunc("/login", LoginHandler)
+	router.HandleFunc("/logout", LogoutHandler)
+	router.HandleFunc("/register", RegisterHandler)
 
-    // Serve React app
-    http.HandleFunc("/", handleIndex)
+	// Static file handlers
+	cssHandler := http.FileServer(http.Dir("public/css"))
+	router.PathPrefix("/public/css/").Handler(http.StripPrefix("/public/css", addHeaders(cssHandler, "text/css", "public/css")))
 
-    fmt.Printf("Running on %s\n", port)
-    log.Fatal(http.ListenAndServe(port, nil))
+	jsHandler := http.FileServer(http.Dir("public/js"))
+	router.PathPrefix("/public/js/").Handler(http.StripPrefix("/public/js", addHeaders(jsHandler, "application/javascript", "public/js")))
+
+	semanticHandler := http.FileServer(http.Dir("public/Semantic-UI-2.3.0/dist"))
+	router.PathPrefix("/public/Semantic-UI-2.3.0/dist/").Handler(http.StripPrefix("/public/Semantic-UI-2.3.0/dist", addHeaders(semanticHandler, "", "public/Semantic-UI-2.3.0/dist")))
+
+	videoHandler := http.FileServer(http.Dir("public/AV"))
+	router.PathPrefix("/public/AV/").Handler(http.StripPrefix("/public/AV", addHeaders(videoHandler, "video/mp4", "public/AV")))
+
+	publicHandler := http.FileServer(http.Dir("public"))
+	router.PathPrefix("/public/").Handler(http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
+
+	// Serve React app
+	router.PathPrefix("/").HandlerFunc(handleIndex)
+
+	// Apply CORS middleware to all routes
+	http.Handle("/", corsMiddleware(router))
+
+	port := ":9090"
+	fmt.Printf("Running Stat HQ on %s\n", port)
+	log.Fatal(http.ListenAndServe(port, nil))
 }
 
 // addHeaders sets explicit or dynamic MIME types with detailed logging
