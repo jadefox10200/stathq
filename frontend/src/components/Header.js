@@ -42,8 +42,8 @@ export default function Header() {
 
   return (
     <div className="ui container">
-      <img src="/public/siteLogo.png" alt="Site Logo" className="h-12 mb-4" />
       <div className="ui large secondary pointing menu">
+        <img src="/public/siteLogo.png" alt="Site Logo" className="h-12 mb-4" />
         <NavLink
           to="/"
           className={({ isActive }) => `item ${isActive ? "active" : ""}`}

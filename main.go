@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,35 +38,36 @@ func AuthMiddleware(requireRole string, next http.Handler) http.Handler {
 		session, err := store.Get(r, "session-name")
 		if err != nil {
 			log.Printf("Session error: %v", err)
-			http.Redirect(w, r, "/login", http.StatusFound)
+			http.Error(w, `{"message": "Session error"}`, http.StatusInternalServerError)
 			return
 		}
 
 		userID, ok := session.Values["user_id"].(int)
 		if !ok || userID == 0 {
 			log.Printf("No user_id in session for %s", r.URL.Path)
-			http.Redirect(w, r, "/login", http.StatusFound)
+			http.Error(w, `{"message": "Unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 
-		// Validate user and role
 		var companyID string
 		var username, role string
 		err = DB.QueryRow("SELECT c.company_id, u.username, u.role FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", userID).Scan(&companyID, &username, &role)
 		if err != nil {
 			log.Printf("User not found for id %d: %v", userID, err)
-			http.Redirect(w, r, "/login", http.StatusFound)
+			http.Error(w, `{"message": "Unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 
 		if requireRole != "" && role != requireRole {
 			log.Printf("User %s (role %s) not authorized for %s (requires %s)", username, role, r.URL.Path, requireRole)
-			http.Error(w, `{"message": "Unauthorized"}`, http.StatusForbidden)
+			http.Error(w, `{"message": "Forbidden"}`, http.StatusForbidden)
 			return
 		}
 
-		log.Printf("Authenticated user %s (company %s, role %s) accessing %s", username, companyID, role, r.URL.Path)
-		next.ServeHTTP(w, r)
+		ctx := r.Context()
+		ctx = context.WithValue(ctx, "company_id", companyID)
+		ctx = context.WithValue(ctx, "user_id", userID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -101,6 +103,175 @@ func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// ListUsersHandler returns all users for the admin's company
+func ListUsersHandler(w http.ResponseWriter, r *http.Request) {
+	companyID := r.Context().Value("company_id").(string)
+	rows, err := DB.Query(`
+		SELECT u.id, u.username, u.role
+		FROM users u
+		JOIN companies c ON u.company_id = c.id
+		WHERE c.company_id = ?
+	`, companyID)
+	if err != nil {
+		log.Printf("Error fetching users for company %s: %v", companyID, err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	users := []map[string]interface{}{}
+	for rows.Next() {
+		var id int
+		var username, role string
+		if err := rows.Scan(&id, &username, &role); err != nil {
+			log.Printf("Error scanning user: %v", err)
+			continue
+		}
+		users = append(users, map[string]interface{}{
+			"id":       id,
+			"username": username,
+			"role":     role,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(users)
+}
+
+// ResetPasswordHandler resets a user's password
+func ResetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		UserID      int    `json:"user_id"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Invalid reset password request: %v", err)
+		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	companyID := r.Context().Value("company_id").(string)
+    var userCompanyID string
+    err := DB.QueryRow("SELECT c.company_id FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", req.UserID).Scan(&userCompanyID)
+    if err != nil || userCompanyID != companyID {
+        log.Printf("User %d not found or not in company %s: %v", req.UserID, companyID, err)
+        http.Error(w, `{"message": "User not found"}`, http.StatusNotFound)
+        return
+    }
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("Error hashing password: %v", err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	_, err = DB.Exec("UPDATE users SET password_hash = ? WHERE id = ?", string(hash), req.UserID)
+	if err != nil {
+		log.Printf("Error updating password for user %d: %v", req.UserID, err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Password reset for user %d in company %s", req.UserID, companyID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "Password reset successful"}`)
+}
+
+// DeleteUserHandler deletes a user
+func DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	userID := vars["id"]
+
+	companyID := r.Context().Value("company_id").(string)
+	adminID := r.Context().Value("user_id").(int)
+
+	if userID == fmt.Sprintf("%d", adminID) {
+		log.Printf("Admin %d attempted to delete themselves", adminID)
+		http.Error(w, `{"message": "Cannot delete own account"}`, http.StatusForbidden)
+		return
+	}
+
+	var userCompanyID string
+    err := DB.QueryRow("SELECT c.company_id FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", userID).Scan(&userCompanyID)
+    if err != nil || userCompanyID != companyID {
+        log.Printf("User %s not found or not in company %s: %v", userID, companyID, err)
+        http.Error(w, `{"message": "User not found"}`, http.StatusNotFound)
+        return
+    }
+
+	_, err = DB.Exec("DELETE FROM users WHERE id = ?", userID)
+	if err != nil {
+		log.Printf("Error deleting user %s: %v", userID, err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Deleted user %s from company %s", userID, companyID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "User deleted successfully"}`)
+}
+
+// UpdateUserRoleHandler updates a user's role
+func UpdateUserRoleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	vars := mux.Vars(r)
+	userID := vars["id"]
+	
+
+	var req struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Invalid update role request: %v", err)
+		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Role != "user" && req.Role != "admin" {
+		log.Printf("Invalid role: %s", req.Role)
+		http.Error(w, `{"message": "Invalid role"}`, http.StatusBadRequest)
+		return
+	}
+
+	companyID := r.Context().Value("company_id").(string)
+	adminID := r.Context().Value("user_id").(int)
+
+	if userID == fmt.Sprintf("%d", adminID) {
+		log.Printf("Admin %d attempted to change their own role", adminID)
+		http.Error(w, `{"message": "Cannot change own role"}`, http.StatusForbidden)
+		return
+	}
+
+	var userCompanyID string
+    err := DB.QueryRow("SELECT c.company_id FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", userID).Scan(&userCompanyID)
+    if err != nil || userCompanyID != companyID {
+        log.Printf("User %s not found or not in company %s: %v", userID, companyID, err)
+        http.Error(w, `{"message": "User not found"}`, http.StatusNotFound)
+        return
+    }
+
+	_, err = DB.Exec("UPDATE users SET role = ? WHERE id = ?", req.Role, userID)
+	if err != nil {
+		log.Printf("Error updating role for user %s: %v", userID, err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Updated role for user %s to %s in company %s", userID, req.Role, companyID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "Role updated successfully"}`)
 }
 
 // LoginHandler handles login requests
@@ -245,28 +416,26 @@ func UserHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"message": "User created successfully"}`)
 }
 
+
 func main() {
 	f := CreateLog()
 	defer f.Close()
 
-	InitDB() // From db.go
+	InitDB()
 
-	// Initialize session store (use a secure key in production)
 	store = sessions.NewCookieStore([]byte("super-secret-key"))
 	store.Options = &sessions.Options{
 		Path:     "/",
-		MaxAge:   3600 * 8, // 8 hours
+		MaxAge:   3600 * 8,
 		HttpOnly: true,
-		Secure:   false, // Set to true in production with HTTPS
+		Secure:   false,
 	}
 
-	// Create router
 	router := mux.NewRouter()
 
-	// CORS middleware
 	corsMiddleware := handlers.CORS(
 		handlers.AllowedOrigins([]string{"http://localhost:3000"}),
-		handlers.AllowedMethods([]string{"GET", "POST", "OPTIONS"}),
+		handlers.AllowedMethods([]string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}),
 		handlers.AllowedHeaders([]string{"Content-Type"}),
 		handlers.AllowCredentials(),
 	)
@@ -281,8 +450,12 @@ func main() {
 	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
 	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
 
-	// Admin-only endpoint
+	// Admin-only endpoints
 	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
+	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
+	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
+	router.Handle("/api/users/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteUserHandler)))
+	router.Handle("/api/users/{id}/role", AuthMiddleware("admin", http.HandlerFunc(UpdateUserRoleHandler)))
 
 	// User info endpoint
 	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
@@ -308,10 +481,8 @@ func main() {
 	publicHandler := http.FileServer(http.Dir("public"))
 	router.PathPrefix("/public/").Handler(http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
 
-	// Serve React app
 	router.PathPrefix("/").HandlerFunc(handleIndex)
 
-	// Apply CORS middleware to all routes
 	http.Handle("/", corsMiddleware(router))
 
 	port := ":9090"

@@ -18,7 +18,6 @@ function ProtectedRoute({ children, requireAdmin = false }) {
   const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
-    // Check authentication
     fetch(`${process.env.REACT_APP_API_URL}/api/user`, {
       credentials: "include",
     })
@@ -26,7 +25,7 @@ function ProtectedRoute({ children, requireAdmin = false }) {
         if (res.ok) {
           setIsAuthenticated(true);
           const data = await res.json();
-          setIsAdmin(data.role === "admin" && requireAdmin);
+          setIsAdmin(data.role === "admin");
         } else {
           setIsAuthenticated(false);
           setIsAdmin(false);
@@ -36,7 +35,7 @@ function ProtectedRoute({ children, requireAdmin = false }) {
         setIsAuthenticated(false);
         setIsAdmin(false);
       });
-  }, [requireAdmin]);
+  }, []);
 
   if (isAuthenticated === null) return <div>Loading...</div>;
   if (!isAuthenticated) return <Navigate to="/login" />;

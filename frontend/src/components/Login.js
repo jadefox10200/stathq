@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { NavLink, useNavigate } from "react-router-dom";
 import { Form, Button, Input, Message } from "semantic-ui-react";
 
 export default function Login() {
@@ -67,6 +67,9 @@ export default function Login() {
         {error && <Message negative>{error}</Message>}
         <Button type="submit" primary>
           Login
+        </Button>
+        <Button as={NavLink} to="/register" secondary>
+          Register
         </Button>
       </Form>
     </div>
