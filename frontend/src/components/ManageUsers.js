@@ -1,6 +1,13 @@
 import { useState, useEffect } from "react";
-import { Form, Button, Message, Table, Dropdown } from "semantic-ui-react";
-import AlertModal from "./AlertModal";
+import {
+  Form,
+  Button,
+  Message,
+  Table,
+  Dropdown,
+  Modal,
+  Header,
+} from "semantic-ui-react";
 
 export default function ManageUsers() {
   const [users, setUsers] = useState([]);
@@ -8,11 +15,14 @@ export default function ManageUsers() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState("user");
+  const [changedRoles, setChangedRoles] = useState({}); // Track pending role changes { userId: newRole }
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [resetPasswordUserId, setResetPasswordUserId] = useState(null);
   const [newPassword, setNewPassword] = useState("");
+  const [modalOpen, setModalOpen] = useState(false);
+  const [userToDelete, setUserToDelete] = useState(null); // Track user for deletion
 
   useEffect(() => {
     // Fetch current user's company_id
@@ -113,12 +123,18 @@ export default function ManageUsers() {
     }
   };
 
-  const handleDeleteUser = async (userId) => {
+  const handleDeleteUser = async (userId, username) => {
+    setUserToDelete({ id: userId, username });
+    setModalOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!userToDelete) return;
     setError("");
     setSuccess("");
     try {
       const response = await fetch(
-        `${process.env.REACT_APP_API_URL}/api/users/${userId}`,
+        `${process.env.REACT_APP_API_URL}/api/users/${userToDelete.id}`,
         {
           method: "DELETE",
           credentials: "include",
@@ -127,7 +143,9 @@ export default function ManageUsers() {
       const data = await response.json();
       if (response.ok) {
         setSuccess(data.message);
-        setUsers(users.filter((user) => user.id !== userId));
+        setUsers(users.filter((user) => user.id !== userToDelete.id));
+        setModalOpen(false);
+        setUserToDelete(null);
       } else {
         setError(data.message || `Failed to delete user: ${response.status}`);
       }
@@ -136,7 +154,9 @@ export default function ManageUsers() {
     }
   };
 
-  const handleUpdateRole = async (userId, newRole) => {
+  const handleUpdateRole = async (userId) => {
+    const newRole = changedRoles[userId];
+    if (!newRole) return;
     setError("");
     setSuccess("");
     try {
@@ -157,6 +177,11 @@ export default function ManageUsers() {
             user.id === userId ? { ...user, role: newRole } : user
           )
         );
+        setChangedRoles((prev) => {
+          const updated = { ...prev };
+          delete updated[userId];
+          return updated;
+        });
       } else {
         setError(data.message || `Failed to update role: ${response.status}`);
       }
@@ -164,6 +189,18 @@ export default function ManageUsers() {
       setError(err.message || "An error occurred. Please try again.");
     }
   };
+
+  const handleRoleChange = (userId, newRole) => {
+    setChangedRoles((prev) => ({
+      ...prev,
+      [userId]: newRole,
+    }));
+  };
+
+  const roleOptions = [
+    { key: "user", text: "User", value: "user" },
+    { key: "admin", text: "Admin", value: "admin" },
+  ];
 
   return (
     <div className="ui container">
@@ -201,10 +238,7 @@ export default function ManageUsers() {
             <label>Role</label>
             <Dropdown
               selection
-              options={[
-                { key: "user", text: "User", value: "user" },
-                { key: "admin", text: "Admin", value: "admin" },
-              ]}
+              options={roleOptions}
               value={role}
               onChange={(e, { value }) => setRole(value)}
             />
@@ -229,13 +263,28 @@ export default function ManageUsers() {
               <Table.Cell>
                 <Dropdown
                   selection
-                  options={[
-                    { key: "user", text: "User", value: "user" },
-                    { key: "admin", text: "Admin", value: "admin" },
-                  ]}
-                  value={user.role}
-                  onChange={(e, { value }) => handleUpdateRole(user.id, value)}
+                  options={roleOptions}
+                  value={changedRoles[user.id] || user.role}
+                  onChange={(e, { value }) => handleRoleChange(user.id, value)}
                 />
+                <Button
+                  style={{
+                    marginLeft: "10px",
+                    backgroundColor:
+                      changedRoles[user.id] &&
+                      changedRoles[user.id] !== user.role
+                        ? "#21ba45" // Green when changed
+                        : "#d3d3d3", // Grey when unchanged
+                    color: "white",
+                  }}
+                  disabled={
+                    !changedRoles[user.id] ||
+                    changedRoles[user.id] === user.role
+                  }
+                  onClick={() => handleUpdateRole(user.id)}
+                >
+                  Save Role
+                </Button>
               </Table.Cell>
               <Table.Cell>
                 <Button
@@ -244,7 +293,10 @@ export default function ManageUsers() {
                 >
                   Reset Password
                 </Button>
-                <Button negative onClick={() => handleDeleteUser(user.id)}>
+                <Button
+                  negative
+                  onClick={() => handleDeleteUser(user.id, user.username)}
+                >
                   Delete
                 </Button>
                 {resetPasswordUserId === user.id && (
@@ -273,7 +325,35 @@ export default function ManageUsers() {
           ))}
         </Table.Body>
       </Table>
-      <AlertModal />
+      <Modal
+        open={modalOpen}
+        onClose={() => {
+          setModalOpen(false);
+          setUserToDelete(null);
+        }}
+        size="small"
+      >
+        <Header content="Confirm Deletion" />
+        <Modal.Content>
+          <p>
+            Are you sure you want to delete user{" "}
+            <strong>{userToDelete?.username}</strong>?
+          </p>
+        </Modal.Content>
+        <Modal.Actions>
+          <Button
+            onClick={() => {
+              setModalOpen(false);
+              setUserToDelete(null);
+            }}
+          >
+            Cancel
+          </Button>
+          <Button negative onClick={confirmDelete}>
+            Delete
+          </Button>
+        </Modal.Actions>
+      </Modal>
     </div>
   );
 }
