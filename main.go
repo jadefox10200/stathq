@@ -32,6 +32,36 @@ var (
 	store *sessions.CookieStore
 )
 
+// webFail – centralised error responder
+// msg: user-facing message
+// w: response writer
+// err: the actual error (optional)
+// data: any extra context (will be printed in logs)
+func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) {
+    // Log everything
+    if err != nil {
+        log.Printf("%s | data: %v | error: %v", msg, data, err)
+        fmt.Printf("%s | data: %v | error: %v\n", msg, data, err)
+    } else {
+        log.Printf("%s | data: %v", msg, data)
+        fmt.Printf("%s | data: %v\n", msg, data)
+    }
+
+    // Build JSON response
+    type errResp struct {
+        Message string `json:"message"`
+        Details string `json:"details,omitempty"`
+    }
+    resp := errResp{Message: msg}
+    if err != nil {
+        resp.Details = err.Error()
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusInternalServerError) // default
+    json.NewEncoder(w).Encode(resp)
+}
+
 // AuthMiddleware checks authentication and optionally role
 func AuthMiddleware(requireRole string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +135,275 @@ func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// ---------- CREATE STAT ----------
+func CreateStatHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+        return
+    }
+
+    // 1. Decode FIRST
+    var req struct {
+        ShortID     string `json:"short_id"`
+        FullName    string `json:"full_name"`
+        Type        string `json:"type"`
+        ValueType   string `json:"value_type"`
+        Reversed    bool   `json:"reversed"`
+        UserIDs     []int  `json:"user_ids"`
+        DivisionIDs []int  `json:"division_ids"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        webFail("Invalid JSON payload", w, err)
+        return
+    }
+
+    // 2. Validate AFTER decode
+    if strings.TrimSpace(req.ShortID) == "" {
+        webFail("Short ID is required", w, nil)
+        return
+    }
+    if strings.TrimSpace(req.FullName) == "" {
+        webFail("Full Name is required", w, nil)
+        return
+    }
+
+    // Optional: sanitize
+    req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
+    req.FullName = strings.TrimSpace(req.FullName)
+
+    // 3. Start transaction
+    tx, err := DB.Begin()
+    if err != nil {
+        webFail("Failed to start transaction", w, err)
+        return
+    }
+
+    // 4. Insert stat
+    res, err := tx.Exec(`
+        INSERT INTO stats (short_id, full_name, type, value_type, reversed) 
+        VALUES (?, ?, ?, ?, ?)`,
+        req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed,
+    )
+    if err != nil {
+        tx.Rollback()
+        webFail("Failed to insert stat", w, err)
+        return
+    }
+
+    statID, _ := res.LastInsertId()
+
+    // 5. Assign users
+    for _, uid := range req.UserIDs {
+        if _, err := tx.Exec(
+            `INSERT INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`,
+            statID, uid,
+        ); err != nil {
+            tx.Rollback()
+            webFail("Failed to assign user", w, err, "user_id", uid)
+            return
+        }
+    }
+
+    // 6. Assign divisions
+    for _, did := range req.DivisionIDs {
+        if _, err := tx.Exec(
+            `INSERT INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`,
+            statID, did,
+        ); err != nil {
+            tx.Rollback()
+            webFail("Failed to assign division", w, err, "division_id", did)
+            return
+        }
+    }
+
+    // 7. Commit
+    if err := tx.Commit(); err != nil {
+        webFail("Failed to commit transaction", w, err)
+        return
+    }
+
+    // 8. Success
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated)
+    json.NewEncoder(w).Encode(map[string]string{"message": "Stat created"})
+}
+
+// ---------- UPDATE STAT ----------
+func UpdateStatHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPatch {
+        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+        return
+    }
+
+    idStr := mux.Vars(r)["id"]
+    id, err := strconv.Atoi(idStr)
+    if err != nil {
+        webFail("Invalid stat ID", w, err)
+        return
+    }
+
+    var req struct {
+        ShortID     string `json:"short_id"`
+        FullName    string `json:"full_name"`
+        Type        string `json:"type"`
+        ValueType   string `json:"value_type"`
+        Reversed    bool   `json:"reversed"`
+        UserIDs     []int  `json:"user_ids"`
+        DivisionIDs []int  `json:"division_ids"`
+    }
+
+    // DECODE FIRST
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        webFail("Invalid JSON payload", w, err)
+        return
+    }
+
+    // VALIDATE
+    if strings.TrimSpace(req.ShortID) == "" {
+        webFail("Short ID is required", w, nil)
+        return
+    }
+    if strings.TrimSpace(req.FullName) == "" {
+        webFail("Full Name is required", w, nil)
+        return
+    }
+
+    req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
+    req.FullName = strings.TrimSpace(req.FullName)
+
+    tx, err := DB.Begin()
+    if err != nil {
+        webFail("Failed to start transaction", w, err)
+        return
+    }
+
+    // Update stat
+    _, err = tx.Exec(`
+        UPDATE stats 
+        SET short_id = ?, full_name = ?, type = ?, value_type = ?, reversed = ?
+        WHERE id = ?`,
+        req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed, id,
+    )
+    if err != nil {
+        tx.Rollback()
+        webFail("Failed to update stat", w, err, "id", id)
+        return
+    }
+
+    // Clear + reassign
+    tx.Exec(`DELETE FROM stat_user_assignments WHERE stat_id = ?`, id)
+    tx.Exec(`DELETE FROM stat_division_assignments WHERE stat_id = ?`, id)
+
+    for _, uid := range req.UserIDs {
+        tx.Exec(`INSERT INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`, id, uid)
+    }
+    for _, did := range req.DivisionIDs {
+        tx.Exec(`INSERT INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`, id, did)
+    }
+
+    if err := tx.Commit(); err != nil {
+        webFail("Failed to commit", w, err)
+        return
+    }
+
+    json.NewEncoder(w).Encode(map[string]string{"message": "Stat updated"})
+}
+
+// ---------- DELETE STAT ----------
+func DeleteStatHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodDelete {
+        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+        return
+    }
+
+    idStr := mux.Vars(r)["id"]
+    id, _ := strconv.Atoi(idStr)
+
+    _, err := DB.Exec(`DELETE FROM stats WHERE id=?`, id)
+    if err != nil {
+        webFail("Failed to delete stat", w, err, "id", id)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"message": "Stat deleted"})
+}
+
+// ---------- LIST ALL STATS (with assignments) ----------
+func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
+    rows, err := DB.Query(`
+        SELECT 
+            s.id, 
+            s.short_id, 
+            s.full_name, 
+            s.type, 
+            s.value_type, 
+            s.reversed,
+            COALESCE(GROUP_CONCAT(DISTINCT sua.user_id), '') AS user_ids,
+            COALESCE(GROUP_CONCAT(DISTINCT sda.division_id), '') AS division_ids
+        FROM stats s
+        LEFT JOIN stat_user_assignments sua ON s.id = sua.stat_id
+        LEFT JOIN stat_division_assignments sda ON s.id = sda.stat_id
+        GROUP BY s.id
+    `)
+    if err != nil {
+        webFail("Failed to query stats", w, err)
+        return
+    }
+    defer rows.Close()
+
+    type stat struct {
+        ID          int    `json:"id"`
+        ShortID     string `json:"short_id"`
+        FullName    string `json:"full_name"`
+        Type        string `json:"type"`
+        ValueType   string `json:"value_type"`
+        Reversed    bool   `json:"reversed"`
+        UserIDs     []int  `json:"user_ids"`
+        DivisionIDs []int  `json:"division_ids"`
+    }
+
+    var stats []stat
+
+    for rows.Next() {
+        var s stat
+        var uids, dids string // will be "" if no assignments
+        if err := rows.Scan(
+            &s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
+            &uids, &dids,
+        ); err != nil {
+            webFail("Failed to scan stat row", w, err)
+            return
+        }
+        s.UserIDs = splitInt(uids)
+        s.DivisionIDs = splitInt(dids)
+        stats = append(stats, s)
+    }
+
+    if err = rows.Err(); err != nil {
+        webFail("Error iterating stats", w, err)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(stats) // [] if no stats
+}
+
+func splitInt(s string) []int {
+    if s == "" {
+        return []int{}
+    }
+    parts := strings.Split(s, ",")
+    out := make([]int, 0, len(parts))
+    for _, p := range parts {
+        if i, err := strconv.Atoi(p); err == nil {
+            out = append(out, i)
+        }
+    }
+    return out
+}
+
 // ListUsersHandler returns all users for the admin's company
 func ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 	companyID := r.Context().Value("company_id").(string)
@@ -138,6 +437,58 @@ func ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(users)
+}
+
+// ChangePasswordHandler allows users to change their own password
+func ChangePasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Invalid change password request: %v", err)
+		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	userID := r.Context().Value("user_id").(int)
+
+	var passwordHash string
+	err := DB.QueryRow("SELECT password_hash FROM users WHERE id = ?", userID).Scan(&passwordHash)
+	if err != nil {
+		log.Printf("User %d not found: %v", userID, err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.OldPassword)); err != nil {
+		log.Printf("Invalid old password for user %d", userID)
+		http.Error(w, `{"message": "Invalid old password"}`, http.StatusUnauthorized)
+		return
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("Error hashing new password: %v", err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	_, err = DB.Exec("UPDATE users SET password_hash = ? WHERE id = ?", string(newHash), userID)
+	if err != nil {
+		log.Printf("Error updating password for user %d: %v", userID, err)
+		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Password changed for user %d", userID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "Password changed successfully"}`)
 }
 
 // ResetPasswordHandler resets a user's password
@@ -440,10 +791,7 @@ func main() {
 		handlers.AllowCredentials(),
 	)
 
-	// Protected API endpoints
-	// router.Handle("/api/classifications", AuthMiddleware("", http.HandlerFunc(handleClassifications)))
-	// router.Handle("/api/divisions", AuthMiddleware("", http.HandlerFunc(handleDivisions)))
-	// router.Handle("/api/stats", AuthMiddleware("", http.HandlerFunc(handleStats)))
+	// services endpoints
 	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleWeeklyStatsRequest)))
 	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleDailyStatsRequest)))
 	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
@@ -456,10 +804,20 @@ func main() {
 	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
 	router.Handle("/api/users/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteUserHandler)))
 	router.Handle("/api/users/{id}/role", AuthMiddleware("admin", http.HandlerFunc(UpdateUserRoleHandler)))
+	router.Handle("/api/stats", AuthMiddleware("admin", http.HandlerFunc(CreateStatHandler))).Methods("POST")
+	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(UpdateStatHandler))).Methods("PATCH")
+	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteStatHandler))).Methods("DELETE")
+	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
+	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
+	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
+	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
 
 	// User info endpoint
 	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
 
+	// Change password endpoint (for any authenticated user)
+	router.Handle("/api/change-password", AuthMiddleware("", http.HandlerFunc(ChangePasswordHandler)))
+	
 	// Auth endpoints (unprotected)
 	router.HandleFunc("/login", LoginHandler)
 	router.HandleFunc("/logout", LogoutHandler)
@@ -488,6 +846,89 @@ func main() {
 	port := ":9090"
 	fmt.Printf("Running Stat HQ on %s\n", port)
 	log.Fatal(http.ListenAndServe(port, nil))
+}
+
+// ---------- LIST ALL DIVISIONS ----------
+func ListDivisionsHandler(w http.ResponseWriter, r *http.Request) {
+    rows, err := DB.Query(`SELECT id, name FROM divisions ORDER BY name`)
+    if err != nil {
+        webFail("Failed to query divisions", w, err)
+        return
+    }
+    defer rows.Close()
+
+    type division struct {
+        ID   int    `json:"id"`
+        Name string `json:"name"`
+    }
+
+    var divs []division
+    for rows.Next() {
+        var d division
+        if err := rows.Scan(&d.ID, &d.Name); err != nil {
+            webFail("Failed to scan division", w, err)
+            return
+        }
+        divs = append(divs, d)
+    }
+
+    if err = rows.Err(); err != nil {
+        webFail("Error reading divisions", w, err)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(divs)
+}
+
+// ---------- CREATE DIVISION ----------
+func CreateDivisionHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+        return
+    }
+
+    var req struct {
+        Name string `json:"name"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        webFail("Invalid JSON", w, err)
+        return
+    }
+    if strings.TrimSpace(req.Name) == "" {
+        webFail("Division name is required", w, nil)
+        return
+    }
+
+    i, err := DB.Exec(`INSERT INTO divisions (name) VALUES (?)`, req.Name)
+    if err != nil {
+        webFail("Failed to create division", w, err)
+        return
+    }
+
+	fmt.Printf("Created div: %s, id: %v\n", req.Name, i)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"message": "Division created"})
+}
+
+// ---------- DELETE DIVISION ----------
+func DeleteDivisionHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodDelete {
+        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+        return
+    }
+
+    idStr := mux.Vars(r)["id"]
+    id, _ := strconv.Atoi(idStr)
+
+    _, err := DB.Exec(`DELETE FROM divisions WHERE id = ?`, id)
+    if err != nil {
+        webFail("Failed to delete division", w, err, "id", id)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"message": "Division deleted"})
 }
 
 // addHeaders sets explicit or dynamic MIME types with detailed logging
@@ -1670,16 +2111,16 @@ func handleLogWeeklyStats(w http.ResponseWriter, r *http.Request) {
 // webFail will print to the standard logger as well as stdout the msg string. The arg 'data' will be appended
 // to show the data that caused the error and the error will also be printed out to these.
 // This call http.Error and sends only the msg back to the client.
-func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) {
-	fullMsg := msg
-	if err != nil {
-		fullMsg += ": " + err.Error()
-	}
-	log.Println(msg, " : ", data, " with error: ", err)
-	fmt.Println(msg, " : ", data, " with error: ", err)
-	http.Error(w, fullMsg, 500)
-	return
-}
+// func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) {
+// 	fullMsg := msg
+// 	if err != nil {
+// 		fullMsg += ": " + err.Error()
+// 	}
+// 	log.Println(msg, " : ", data, " with error: ", err)
+// 	fmt.Println(msg, " : ", data, " with error: ", err)
+// 	http.Error(w, fullMsg, 500)
+// 	return
+// }
 
 // Creates the log.txt which will log activity (mostly used for error logging). This appends all new data to the file.
 func CreateLog() *os.File {

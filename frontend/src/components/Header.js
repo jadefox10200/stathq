@@ -94,6 +94,12 @@ export default function Header() {
             Manage Users
           </NavLink>
         )}
+        <NavLink
+          to="/change-password"
+          className={({ isActive }) => `item ${isActive ? "active" : ""}`}
+        >
+          Change Password
+        </NavLink>
         <div className="right menu">
           <button className="item" onClick={handleLogout}>
             Logout

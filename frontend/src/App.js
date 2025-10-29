@@ -5,6 +5,7 @@ import Home from "./components/Home";
 import Login from "./components/Login";
 import Register from "./components/Register";
 import ManageUsers from "./components/ManageUsers";
+import ChangePassword from "./components/ChangePassword";
 import InputDailyStats from "./components/InputDailyStats";
 import InputWeeklyStats from "./components/InputWeeklyStats";
 import ViewDailyStats from "./components/ViewDailyStats";
@@ -64,6 +65,15 @@ export default function App() {
             <ProtectedRoute requireAdmin={true}>
               <Header />
               <ManageUsers />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/change-password"
+          element={
+            <ProtectedRoute>
+              <Header />
+              <ChangePassword />
             </ProtectedRoute>
           }
         />

@@ -20,11 +20,14 @@ func InitDB() {
 
 	// Create tables
 	_, err = DB.Exec(`
+		-- Companies
 		CREATE TABLE IF NOT EXISTS companies (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			company_id TEXT NOT NULL UNIQUE,
 			name TEXT NOT NULL
 		);
+
+		-- Users
 		CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			company_id INTEGER NOT NULL,
@@ -33,13 +36,47 @@ func InitDB() {
 			role TEXT NOT NULL CHECK(role IN ('admin', 'user')),
 			FOREIGN KEY (company_id) REFERENCES companies(id)
 		);
+
+		-- Divisions
+		CREATE TABLE IF NOT EXISTS divisions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL
+		);
+
+		-- Classifications (kept for legacy, but not used in new stats)
+		CREATE TABLE IF NOT EXISTS classifications (
+			name TEXT PRIMARY KEY
+		);
+
+		-- === STATS TABLE (only one!) ===
 		CREATE TABLE IF NOT EXISTS stats (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL,
-			classification_name TEXT NOT NULL,
-			unit TEXT NOT NULL,
-			upsidedown BOOLEAN NOT NULL
+			short_id TEXT NOT NULL UNIQUE,           -- e.g. "GI"
+			full_name TEXT NOT NULL,                 -- e.g. "Gross Income"
+			type TEXT NOT NULL CHECK(type IN ('personal','divisional','main')),
+			value_type TEXT NOT NULL CHECK(value_type IN ('number','currency','percentage')),
+			reversed BOOLEAN NOT NULL DEFAULT 0
 		);
+
+		-- Stat → User assignments
+		CREATE TABLE IF NOT EXISTS stat_user_assignments (
+			stat_id INTEGER,
+			user_id INTEGER,
+			PRIMARY KEY (stat_id, user_id),
+			FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		);
+
+		-- Stat → Division assignments
+		CREATE TABLE IF NOT EXISTS stat_division_assignments (
+			stat_id INTEGER,
+			division_id INTEGER,
+			PRIMARY KEY (stat_id, division_id),
+			FOREIGN KEY(stat_id) REFERENCES stats(id) ON DELETE CASCADE,
+			FOREIGN KEY(division_id) REFERENCES divisions(id) ON DELETE CASCADE
+		);
+
+		-- Daily stats (legacy - kept for now)
 		CREATE TABLE IF NOT EXISTS daily_stats (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
@@ -47,19 +84,14 @@ func InitDB() {
 			value INTEGER NOT NULL,
 			division_id INTEGER NOT NULL
 		);
+
+		-- Weekly stats (legacy - kept for now)
 		CREATE TABLE IF NOT EXISTS weekly_stats (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
 			week_ending TEXT NOT NULL,
 			value INTEGER NOT NULL,
 			division_id INTEGER NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS classifications (
-			name TEXT PRIMARY KEY
-		);
-		CREATE TABLE IF NOT EXISTS divisions (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL
 		);
 	`)
 	if err != nil {
@@ -113,7 +145,7 @@ func RegisterCompany(companyID, companyName, adminUsername, adminPassword string
 // RegisterUser adds a new user to an existing company
 func RegisterUser(companyID, username, password, role string) error {
 	// Validate role
-	if role != "admin" && role != "user" {
+	if role != "admin" && role != "user" && role != "manager" {
 		return fmt.Errorf("invalid role: %s", role)
 	}
 
