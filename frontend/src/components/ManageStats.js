@@ -1,5 +1,4 @@
-// src/pages/ManageStats.js
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import {
   Form,
   Button,
@@ -7,31 +6,22 @@ import {
   Input,
   Table,
   Header,
-  Icon,
   Checkbox,
+  Modal,
+  Message,
+  Icon,
 } from "semantic-ui-react";
+import DivisionManager from "./DivisionManager";
 
 const API = process.env.REACT_APP_API_URL || "";
 
 export default function ManageStats() {
-  // === Global Modal & Alert ===
-  const showAlert = (header, message) => {
-    $("#alertHeader").text(header);
-    $("#alertMessage").html(
-      String(message)
-        .replace(/\n/g, "<br>")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-    );
-    $("#alertModal").modal("show");
-  };
-
-  // === Reference Data ===
+  // reference data
   const [users, setUsers] = useState([]);
   const [divisions, setDivisions] = useState([]);
   const [stats, setStats] = useState([]);
 
-  // === Form State ===
+  // form state
   const [editId, setEditId] = useState(null);
   const [shortId, setShortId] = useState("");
   const [fullName, setFullName] = useState("");
@@ -40,51 +30,52 @@ export default function ManageStats() {
   const [reversed, setReversed] = useState(false);
   const [assignedUsers, setAssignedUsers] = useState([]);
   const [assignedDivs, setAssignedDivs] = useState([]);
+  const [responsibleUser, setResponsibleUser] = useState(null);
 
-  // === Division Modal ===
-  const [newDivName, setNewDivName] = useState("");
+  // UI state
+  const [divisionModalOpen, setDivisionModalOpen] = useState(false);
+  const [alertOpen, setAlertOpen] = useState(false);
+  const [alertHeader, setAlertHeader] = useState("");
+  const [alertMessage, setAlertMessage] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  // === Load Data ===
-  useEffect(() => {
-    // Initialize modal
-    $("#alertModal").modal({
-      closable: true,
-      onApprove: () => false,
-    });
+  // helpers
+  const showAlert = (header, message) => {
+    setAlertHeader(header);
+    setAlertMessage(String(message));
+    setAlertOpen(true);
+  };
 
-    $(document)
-      .off("click", "#okButton")
-      .on("click", "#okButton", () => {
-        $("#alertModal").modal("hide");
-      });
-
-    const fetchJSON = async (url, name) => {
-      try {
-        const res = await fetch(url, { credentials: "include" });
-        const text = await res.text();
-        if (!res.ok) {
-          let msg = `Failed to load ${name.toLowerCase()}`;
-          try {
-            const err = JSON.parse(text);
-            msg = err.message || msg;
-            if (err.details) console.error(`${name} details:`, err.details);
-          } catch {
-            console.error(`${name} raw error:`, text);
-          }
-          throw new Error(msg);
+  const fetchJSON = async (url, name) => {
+    try {
+      const res = await fetch(url, { credentials: "include" });
+      const text = await res.text();
+      if (!res.ok) {
+        let msg = `Failed to load ${name.toLowerCase()}`;
+        try {
+          const err = JSON.parse(text);
+          msg = err.message || msg;
+          if (err.details) console.error(`${name} details:`, err.details);
+        } catch {
+          console.error(`${name} raw error:`, text);
         }
-        return JSON.parse(text);
-      } catch (err) {
-        showAlert("Load Error", err.message);
-        return null;
+        throw new Error(msg);
       }
-    };
+      return JSON.parse(text);
+    } catch (err) {
+      showAlert("Load Error", err.message);
+      return null;
+    }
+  };
 
-    Promise.all([
-      fetchJSON(`${API}/api/users`, "Users"),
-      fetchJSON(`${API}/api/divisions`, "Divisions"),
-      fetchJSON(`${API}/api/stats/all`, "Stats"),
-    ]).then(([u, d, s]) => {
+  // initial load
+  useEffect(() => {
+    (async () => {
+      const [u, d, s] = await Promise.all([
+        fetchJSON(`${API}/api/users`, "Users"),
+        fetchJSON(`${API}/api/divisions`, "Divisions"),
+        fetchJSON(`${API}/api/stats/all`, "Stats"),
+      ]);
       if (u) {
         setUsers(u.map((x) => ({ key: x.id, text: x.username, value: x.id })));
       }
@@ -94,65 +85,28 @@ export default function ManageStats() {
       if (s) {
         setStats(Array.isArray(s) ? s : []);
       }
-    });
+    })();
   }, []);
 
-  // === Refresh Divisions ===
   const refreshDivisions = async () => {
-    const d = await fetch(`${API}/api/divisions`, {
-      credentials: "include",
-    }).then((r) => r.json());
-    setDivisions(d.map((x) => ({ key: x.id, text: x.name, value: x.id })));
-  };
-
-  // === Create Division ===
-  const createDivision = async () => {
-    const name = newDivName.trim();
-    if (!name) {
-      showAlert("Invalid Input", "Division name is required");
-      return;
-    }
     try {
-      const res = await fetch(`${API}/api/divisions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ name }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setNewDivName("");
-        refreshDivisions();
-        showAlert("Success", data.message);
-      } else {
-        showAlert("Error", data.message);
-      }
-    } catch {
-      showAlert("Network Error", "Could not create division");
+      const d = await fetch(`${API}/api/divisions`, { credentials: "include" }).then((r) => r.json());
+      setDivisions(d.map((x) => ({ key: x.id, text: x.name, value: x.id })));
+    } catch (err) {
+      showAlert("Network Error", "Could not refresh divisions");
     }
   };
 
-  // === Delete Division ===
-  const deleteDivision = async (id, name) => {
-    if (!window.confirm(`Delete division "${name}"?`)) return;
+  const refreshStats = async () => {
     try {
-      const res = await fetch(`${API}/api/divisions/${id}`, {
-        method: "DELETE",
-        credentials: "include",
-      });
-      const data = await res.json();
-      if (res.ok) {
-        refreshDivisions();
-        showAlert("Success", data.message);
-      } else {
-        showAlert("Error", data.message);
-      }
-    } catch {
-      showAlert("Network Error", "Could not delete division");
+      const s = await fetch(`${API}/api/stats/all`, { credentials: "include" }).then((r) => r.json());
+      setStats(Array.isArray(s) ? s : []);
+    } catch (err) {
+      showAlert("Network Error", "Could not refresh stats");
     }
   };
 
-  // === Form Helpers ===
+  // create/update stat
   const resetForm = () => {
     setEditId(null);
     setShortId("");
@@ -162,23 +116,30 @@ export default function ManageStats() {
     setReversed(false);
     setAssignedUsers([]);
     setAssignedDivs([]);
+    setResponsibleUser(null);
   };
 
   const startEdit = (stat) => {
     setEditId(stat.id);
-    setShortId(stat.short_id);
-    setFullName(stat.full_name);
-    setType(stat.type);
-    setValueType(stat.value_type);
-    setReversed(stat.reversed);
+    setShortId(stat.short_id || "");
+    setFullName(stat.full_name || "");
+    setType(stat.type || "personal");
+    setValueType(stat.value_type || "number");
+    setReversed(!!stat.reversed);
     setAssignedUsers(stat.user_ids || []);
     setAssignedDivs(stat.division_ids || []);
+    setResponsibleUser(stat.responsible_user_id || null);
   };
 
   const submitStat = async (e) => {
     e.preventDefault();
+
     if (!shortId.trim() || !fullName.trim()) {
       showAlert("Validation", "Short ID and Full Name are required");
+      return;
+    }
+    if (!responsibleUser) {
+      showAlert("Validation", "Responsible user is required for every stat");
       return;
     }
 
@@ -188,11 +149,14 @@ export default function ManageStats() {
       full_name: fullName.trim(),
       type,
       value_type: valueType,
-      reversed,
-      user_ids: type === "personal" ? assignedUsers : [],
-      division_ids: type === "divisional" ? assignedDivs : [],
+      reversed: !!reversed,
+      // assigned users are allowed regardless of stat.type per request
+      user_ids: Array.isArray(assignedUsers) ? assignedUsers : [],
+      division_ids: type === "divisional" && Array.isArray(assignedDivs) ? assignedDivs : [],
+      responsible_user_id: responsibleUser,
     };
 
+    setLoading(true);
     try {
       const url = editId ? `${API}/api/stats/${editId}` : `${API}/api/stats`;
       const method = editId ? "PATCH" : "POST";
@@ -204,21 +168,20 @@ export default function ManageStats() {
       });
       const data = await res.json();
       if (res.ok) {
-        showAlert("Success", data.message);
+        showAlert("Success", data.message || "Stat saved");
         resetForm();
-        const s = await fetch(`${API}/api/stats/all`, {
-          credentials: "include",
-        }).then((r) => r.json());
-        setStats(s);
+        await refreshStats();
       } else {
-        showAlert("Error", data.message);
+        showAlert("Error", data.message || "Failed to save stat");
       }
-    } catch {
+    } catch (err) {
+      console.error(err);
       showAlert("Network Error", "Could not save stat");
+    } finally {
+      setLoading(false);
     }
   };
 
-  // === Delete Stat ===
   const deleteStat = async (id, name) => {
     if (!window.confirm(`Delete stat "${name}"?`)) return;
     try {
@@ -228,46 +191,57 @@ export default function ManageStats() {
       });
       const data = await res.json();
       if (res.ok) {
-        showAlert("Success", data.message);
-        setStats(stats.filter((s) => s.id !== id));
+        showAlert("Success", data.message || "Stat deleted");
+        setStats((s) => s.filter((st) => st.id !== id));
       } else {
-        showAlert("Error", data.message);
+        showAlert("Error", data.message || "Failed to delete stat");
       }
     } catch {
       showAlert("Network Error", "Could not delete stat");
     }
   };
 
-  // === Render ===
+  // map assigned display names safely (normalize id types to string)
+  const mapAssignedNames = (stat) => {
+    const assigned = [];
+    if (stat.user_ids?.length) {
+      assigned.push(
+        ...stat.user_ids.map(
+          (id) => users.find((u) => String(u.value) === String(id))?.text || id
+        )
+      );
+    }
+    if (stat.division_ids?.length) {
+      assigned.push(
+        ...stat.division_ids.map(
+          (id) => divisions.find((d) => String(d.value) === String(id))?.text || id
+        )
+      );
+    }
+    return assigned.length ? assigned.join(", ") : "—";
+  };
+
   return (
     <div className="ui container" style={{ marginTop: "2rem" }}>
       <Header as="h1" textAlign="center">
         Manage Stats
       </Header>
 
-      {/* === CREATE / EDIT FORM === */}
+      {/* Create / Edit Form */}
       <div className="ui raised segment">
         <Header as="h3" dividing>
           {editId ? "Edit Stat" : "Create New Stat"}
         </Header>
 
-        <Form onSubmit={submitStat}>
+        <Form onSubmit={submitStat} loading={loading}>
           <Form.Group widths="equal">
             <Form.Field required>
               <label>Short ID (e.g. GI)</label>
-              <Input
-                placeholder="GI"
-                value={shortId}
-                onChange={(e) => setShortId(e.target.value)}
-              />
+              <Input placeholder="GI" value={shortId} onChange={(e) => setShortId(e.target.value)} />
             </Form.Field>
             <Form.Field required>
               <label>Full Name</label>
-              <Input
-                placeholder="Gross Income"
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-              />
+              <Input placeholder="Gross Income" value={fullName} onChange={(e) => setFullName(e.target.value)} />
             </Form.Field>
           </Form.Group>
 
@@ -278,11 +252,7 @@ export default function ManageStats() {
                 selection
                 options={[
                   { key: "personal", text: "Personal", value: "personal" },
-                  {
-                    key: "divisional",
-                    text: "Divisional",
-                    value: "divisional",
-                  },
+                  { key: "divisional", text: "Divisional", value: "divisional" },
                   { key: "main", text: "Main (Company)", value: "main" },
                 ]}
                 value={type}
@@ -297,117 +267,61 @@ export default function ManageStats() {
                 options={[
                   { key: "number", text: "Number", value: "number" },
                   { key: "currency", text: "Currency ($)", value: "currency" },
-                  {
-                    key: "percentage",
-                    text: "Percentage (%)",
-                    value: "percentage",
-                  },
+                  { key: "percentage", text: "Percentage (%)", value: "percentage" },
                 ]}
                 value={valueType}
                 onChange={(_, { value }) => setValueType(value)}
               />
             </Form.Field>
+
+            <Form.Field>
+              <label>Reversed (upside-down)</label>
+              <Checkbox toggle checked={reversed} onChange={(_, { checked }) => setReversed(!!checked)} />
+            </Form.Field>
           </Form.Group>
 
-          <Form.Field>
-            <Checkbox
-              label="Reversed (upside-down)"
-              checked={reversed}
-              onChange={(_, { checked }) => setReversed(checked)}
+          <Form.Field required>
+            <label>Responsible</label>
+            <Dropdown
+              placeholder="Select responsible user"
+              fluid
+              selection
+              options={users}
+              value={responsibleUser}
+              onChange={(_, { value }) => setResponsibleUser(value)}
             />
           </Form.Field>
 
-          {type === "personal" && (
-            <Form.Field>
-              <label>Assign to Users</label>
-              <Dropdown
-                placeholder="Select users"
-                fluid
-                multiple
-                selection
-                options={users}
-                value={assignedUsers}
-                onChange={(_, { value }) => setAssignedUsers(value)}
-              />
-            </Form.Field>
-          )}
+          <Form.Field>
+            <label>Assign to Users</label>
+            <Dropdown
+              placeholder="Select users"
+              fluid
+              multiple
+              selection
+              options={users}
+              value={assignedUsers}
+              onChange={(_, { value }) => setAssignedUsers(value)}
+            />
+          </Form.Field>
 
           {type === "divisional" && (
             <Form.Field>
-              <label>Assign to Divisions</label>
-              <div
-                style={{ display: "flex", gap: "0.5rem", alignItems: "end" }}
-              >
-                <Dropdown
-                  placeholder="Select divisions"
-                  fluid
-                  multiple
-                  selection
-                  options={divisions}
-                  value={assignedDivs}
-                  onChange={(_, { value }) => setAssignedDivs(value)}
-                  style={{ flex: 1 }}
-                />
-                <Button
-                  type="button"
-                  icon="cogs"
-                  content="Manage"
-                  onClick={() => {
-                    setNewDivName("");
-                    $("#alertModal .header").text("Manage Divisions");
-                    $("#alertModal .content").html(`
-                      <div class="ui form">
-                        <div class="field">
-                          <label>New Division</label>
-                          <input type="text" id="newDivInput" placeholder="Enter name" value="" />
-                        </div>
-                        <button class="ui primary button" id="addDivBtn">Add Division</button>
-                      </div>
-                      <div style="margin-top:1rem;">
-                        <strong>Existing Divisions:</strong>
-                        <div id="divList" style="max-height:200px; overflow-y:auto; margin-top:0.5rem;"></div>
-                      </div>
-                    `);
-
-                    // Populate list
-                    const list = divisions.length
-                      ? divisions
-                          .map(
-                            (d) => `
-                          <div style="display:flex; justify-content:space-between; margin:0.3rem 0; padding:0.3rem; border-bottom:1px solid #eee;">
-                            <span>${d.text}</span>
-                            <i class="trash icon red link" data-id="${d.value}" style="cursor:pointer;"></i>
-                          </div>
-                        `
-                          )
-                          .join("")
-                      : "<em style='color:#999;'>No divisions yet</em>";
-                    $("#divList").html(list);
-
-                    // Bind events
-                    $(document).on("click", "#addDivBtn", () => {
-                      const val = $("#newDivInput").val().trim();
-                      console.log("newDiv: ", val);
-                      if (val) {
-                        setNewDivName(val);
-                        createDivision();
-                        $("#alertModal").modal("hide");
-                      }
-                    });
-
-                    $(document)
-                      .off("click", ".trash.icon")
-                      .on("click", ".trash.icon", function () {
-                        const id = $(this).data("id");
-                        const name = $(this).parent().find("span").text();
-                        deleteDivision(id, name);
-                        $("#alertModal").modal("hide");
-                      });
-
-                    $("#alertModal").modal("show");
-                  }}
-                />
-              </div>
+              <label>
+                Assign to Divisions{" "}
+                <Button basic size="tiny" onClick={() => setDivisionModalOpen(true)} icon>
+                  <Icon name="cogs" /> Manage
+                </Button>
+              </label>
+              <Dropdown
+                placeholder="Select divisions"
+                fluid
+                multiple
+                selection
+                options={divisions}
+                value={assignedDivs}
+                onChange={(_, { value }) => setAssignedDivs(value)}
+              />
             </Form.Field>
           )}
 
@@ -422,7 +336,7 @@ export default function ManageStats() {
         </Form>
       </div>
 
-      {/* === LIST OF STATS === */}
+      {/* List of Stats */}
       <div className="ui raised segment" style={{ marginTop: "2rem" }}>
         <Header as="h3" dividing>
           Existing Stats
@@ -435,71 +349,59 @@ export default function ManageStats() {
               <Table.HeaderCell>Type</Table.HeaderCell>
               <Table.HeaderCell>Value Type</Table.HeaderCell>
               <Table.HeaderCell>Reversed</Table.HeaderCell>
+              <Table.HeaderCell>Responsible</Table.HeaderCell>
               <Table.HeaderCell>Assigned To</Table.HeaderCell>
               <Table.HeaderCell>Actions</Table.HeaderCell>
             </Table.Row>
           </Table.Header>
           <Table.Body>
-            {stats.map((s) => {
-              const assigned = [];
-              if (s.user_ids?.length)
-                assigned.push(
-                  ...s.user_ids.map(
-                    (id) => users.find((u) => u.value === id)?.text || id
-                  )
-                );
-              if (s.division_ids?.length)
-                assigned.push(
-                  ...s.division_ids.map(
-                    (id) => divisions.find((d) => d.value === id)?.text || id
-                  )
-                );
-              return (
-                <Table.Row key={s.id}>
-                  <Table.Cell>
-                    <strong>{s.short_id}</strong>
-                  </Table.Cell>
-                  <Table.Cell>{s.full_name}</Table.Cell>
-                  <Table.Cell>{s.type}</Table.Cell>
-                  <Table.Cell>{s.value_type}</Table.Cell>
-                  <Table.Cell>{s.reversed ? "Yes" : "No"}</Table.Cell>
-                  <Table.Cell>
-                    {assigned.length ? assigned.join(", ") : "—"}
-                  </Table.Cell>
-                  <Table.Cell>
-                    <Button
-                      size="mini"
-                      icon="edit"
-                      onClick={() => startEdit(s)}
-                    />
-                    <Button
-                      size="mini"
-                      icon="trash"
-                      negative
-                      onClick={() => deleteStat(s.id, s.full_name)}
-                    />
-                  </Table.Cell>
-                </Table.Row>
-              );
-            })}
+            {stats.map((s) => (
+              <Table.Row key={s.id}>
+                <Table.Cell>
+                  <strong>{s.short_id}</strong>
+                </Table.Cell>
+                <Table.Cell>{s.full_name}</Table.Cell>
+                <Table.Cell>{s.type}</Table.Cell>
+                <Table.Cell>{s.value_type}</Table.Cell>
+                <Table.Cell>{s.reversed ? "Yes" : "No"}</Table.Cell>
+                <Table.Cell>
+                  {users.find((u) => String(u.value) === String(s.responsible_user_id))
+                    ? users.find((u) => String(u.value) === String(s.responsible_user_id)).text
+                    : s.responsible_user_id || "—"}
+                </Table.Cell>
+                <Table.Cell>{mapAssignedNames(s)}</Table.Cell>
+                <Table.Cell>
+                  <Button size="mini" icon="edit" onClick={() => startEdit(s)} />
+                  <Button size="mini" icon="trash" negative onClick={() => deleteStat(s.id, s.full_name)} />
+                </Table.Cell>
+              </Table.Row>
+            ))}
           </Table.Body>
         </Table>
       </div>
 
-      {/* === GLOBAL MODAL === */}
-      <div className="ui modal" id="alertModal">
-        <div className="header" id="alertHeader">
-          Alert
-        </div>
-        <div className="content">
-          <p id="alertMessage"></p>
-        </div>
-        <div className="actions">
-          <div className="ui button" id="okButton">
-            OK
-          </div>
-        </div>
-      </div>
+      {/* Division Manager modal (react) */}
+      <DivisionManager
+        open={divisionModalOpen}
+        onClose={async () => {
+          setDivisionModalOpen(false);
+          await refreshDivisions();
+        }}
+        divisions={divisions}
+        refreshDivisions={refreshDivisions}
+        showAlert={showAlert}
+      />
+
+      {/* Alert Modal */}
+      <Modal open={alertOpen} onClose={() => setAlertOpen(false)} size="small">
+        <Modal.Header>{alertHeader}</Modal.Header>
+        <Modal.Content>
+          <Message content={alertMessage} />
+        </Modal.Content>
+        <Modal.Actions>
+          <Button onClick={() => setAlertOpen(false)}>OK</Button>
+        </Modal.Actions>
+      </Modal>
     </div>
   );
 }
