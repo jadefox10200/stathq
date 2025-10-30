@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Include main.css and home.css styles */
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 20px;
+}
+.center-it {
+  text-align: center;
+}
+.ui.container {
+  margin: 0 auto;
+  max-width: 1200px;
+}
+#homeBody {
+  margin: 20px;
+}
+video {
+  display: block;
+  margin: 0 auto;
+}
+label {
+  display: block;
+  text-align: center;
+  margin-top: 10px;
+}
