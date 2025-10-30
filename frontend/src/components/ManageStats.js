@@ -128,7 +128,8 @@ export default function ManageStats() {
     setReversed(!!stat.reversed);
     setAssignedUsers(stat.user_ids || []);
     setAssignedDivs(stat.division_ids || []);
-    setResponsibleUser(stat.responsible_user_id || null);
+    // backend may or may not return responsible_user_id; handle both cases
+    setResponsibleUser(stat.responsible_user_id ?? null);
   };
 
   const submitStat = async (e) => {
@@ -138,11 +139,8 @@ export default function ManageStats() {
       showAlert("Validation", "Short ID and Full Name are required");
       return;
     }
-    if (!responsibleUser) {
-      showAlert("Validation", "Responsible user is required for every stat");
-      return;
-    }
 
+    // Build payload and only include optional fields if set
     const payload = {
       id: editId,
       short_id: shortId.trim().toUpperCase(),
@@ -150,11 +148,12 @@ export default function ManageStats() {
       type,
       value_type: valueType,
       reversed: !!reversed,
-      // assigned users are allowed regardless of stat.type per request
       user_ids: Array.isArray(assignedUsers) ? assignedUsers : [],
       division_ids: type === "divisional" && Array.isArray(assignedDivs) ? assignedDivs : [],
-      responsible_user_id: responsibleUser,
     };
+    if (responsibleUser !== null && responsibleUser !== undefined && responsibleUser !== "") {
+      payload.responsible_user_id = responsibleUser;
+    }
 
     setLoading(true);
     try {
@@ -280,15 +279,17 @@ export default function ManageStats() {
             </Form.Field>
           </Form.Group>
 
-          <Form.Field required>
+          {/* Responsible is optional now */}
+          <Form.Field>
             <label>Responsible</label>
             <Dropdown
-              placeholder="Select responsible user"
+              placeholder="Select responsible user (optional)"
               fluid
               selection
               options={users}
               value={responsibleUser}
               onChange={(_, { value }) => setResponsibleUser(value)}
+              clearable
             />
           </Form.Field>
 
