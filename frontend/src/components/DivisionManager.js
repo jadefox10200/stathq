@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Modal, Button, Input, List, Icon, Confirm } from "semantic-ui-react";
 
 const API = process.env.REACT_APP_API_URL || "";
@@ -15,8 +15,18 @@ export default function DivisionManager({
   const [pendingDelete, setPendingDelete] = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // Clear and focus input when modal opens
+  useEffect(() => {
+    if (open) {
+      setNewName("");
+      // autofocus handled by prop on the Input element
+    }
+  }, [open]);
+
   const createDivision = async (nameParam) => {
-    const name = (typeof nameParam !== "undefined" ? nameParam : newName).trim();
+    const name = (
+      typeof nameParam !== "undefined" ? nameParam : newName
+    ).trim();
     if (!name) {
       showAlert?.("Validation", "Division name is required");
       return;
@@ -76,12 +86,44 @@ export default function DivisionManager({
   };
 
   return (
-    <Modal open={open} onClose={onClose} size="small">
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="small"
+      closeOnDimmerClick={!loading}
+    >
       <Modal.Header>Manage Divisions</Modal.Header>
       <Modal.Content>
-        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
-          <Input placeholder="New division name" value={newName} onChange={(e) => setNewName(e.target.value)} fluid />
-          <Button primary onClick={() => createDivision(newName)} loading={loading}>
+        <div
+          style={{
+            display: "flex",
+            gap: "0.5rem",
+            marginBottom: "1rem",
+            alignItems: "center",
+          }}
+        >
+          {/* Give the Input flex:1 so it expands within the flex row, autofocus for UX,
+              prevent Enter from submitting outer forms by handling keyDown: */}
+          <Input
+            placeholder="New division name"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            fluid
+            style={{ flex: 1 }}
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault(); // avoid submitting any outer form
+                createDivision(newName);
+              }
+            }}
+          />
+          <Button
+            primary
+            type="button" // ensure this button does NOT submit any parent form
+            onClick={() => createDivision(newName)}
+            loading={loading}
+          >
             Add
           </Button>
         </div>
@@ -91,7 +133,13 @@ export default function DivisionManager({
             divisions.map((d) => (
               <List.Item key={d.key}>
                 <List.Content floated="right">
-                  <Button icon size="mini" negative onClick={() => askDelete({ id: d.value, name: d.text })}>
+                  <Button
+                    icon
+                    size="mini"
+                    negative
+                    type="button" // safe: prevent accidental form submit
+                    onClick={() => askDelete({ id: d.value, name: d.text })}
+                  >
                     <Icon name="trash" />
                   </Button>
                 </List.Content>
@@ -104,14 +152,20 @@ export default function DivisionManager({
         </List>
       </Modal.Content>
       <Modal.Actions>
-        <Button onClick={onClose}>Close</Button>
+        <Button type="button" onClick={onClose} disabled={loading}>
+          Close
+        </Button>
       </Modal.Actions>
 
       <Confirm
         open={confirmOpen}
         onCancel={() => setConfirmOpen(false)}
         onConfirm={doDelete}
-        content={pendingDelete ? `Delete division "${pendingDelete.name}"?` : "Delete division?"}
+        content={
+          pendingDelete
+            ? `Delete division "${pendingDelete.name}"?`
+            : "Delete division?"
+        }
       />
     </Modal>
   );

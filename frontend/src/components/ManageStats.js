@@ -30,7 +30,6 @@ export default function ManageStats() {
   const [reversed, setReversed] = useState(false);
   const [assignedUsers, setAssignedUsers] = useState([]);
   const [assignedDivs, setAssignedDivs] = useState([]);
-  const [responsibleUser, setResponsibleUser] = useState(null);
 
   // UI state
   const [divisionModalOpen, setDivisionModalOpen] = useState(false);
@@ -90,7 +89,9 @@ export default function ManageStats() {
 
   const refreshDivisions = async () => {
     try {
-      const d = await fetch(`${API}/api/divisions`, { credentials: "include" }).then((r) => r.json());
+      const d = await fetch(`${API}/api/divisions`, {
+        credentials: "include",
+      }).then((r) => r.json());
       setDivisions(d.map((x) => ({ key: x.id, text: x.name, value: x.id })));
     } catch (err) {
       showAlert("Network Error", "Could not refresh divisions");
@@ -99,7 +100,9 @@ export default function ManageStats() {
 
   const refreshStats = async () => {
     try {
-      const s = await fetch(`${API}/api/stats/all`, { credentials: "include" }).then((r) => r.json());
+      const s = await fetch(`${API}/api/stats/all`, {
+        credentials: "include",
+      }).then((r) => r.json());
       setStats(Array.isArray(s) ? s : []);
     } catch (err) {
       showAlert("Network Error", "Could not refresh stats");
@@ -116,7 +119,6 @@ export default function ManageStats() {
     setReversed(false);
     setAssignedUsers([]);
     setAssignedDivs([]);
-    setResponsibleUser(null);
   };
 
   const startEdit = (stat) => {
@@ -128,8 +130,6 @@ export default function ManageStats() {
     setReversed(!!stat.reversed);
     setAssignedUsers(stat.user_ids || []);
     setAssignedDivs(stat.division_ids || []);
-    // backend may or may not return responsible_user_id; handle both cases
-    setResponsibleUser(stat.responsible_user_id ?? null);
   };
 
   const submitStat = async (e) => {
@@ -140,7 +140,7 @@ export default function ManageStats() {
       return;
     }
 
-    // Build payload and only include optional fields if set
+    // Build payload and include optional fields when present
     const payload = {
       id: editId,
       short_id: shortId.trim().toUpperCase(),
@@ -149,11 +149,8 @@ export default function ManageStats() {
       value_type: valueType,
       reversed: !!reversed,
       user_ids: Array.isArray(assignedUsers) ? assignedUsers : [],
-      division_ids: type === "divisional" && Array.isArray(assignedDivs) ? assignedDivs : [],
+      division_ids: Array.isArray(assignedDivs) ? assignedDivs : [],
     };
-    if (responsibleUser !== null && responsibleUser !== undefined && responsibleUser !== "") {
-      payload.responsible_user_id = responsibleUser;
-    }
 
     setLoading(true);
     try {
@@ -213,7 +210,8 @@ export default function ManageStats() {
     if (stat.division_ids?.length) {
       assigned.push(
         ...stat.division_ids.map(
-          (id) => divisions.find((d) => String(d.value) === String(id))?.text || id
+          (id) =>
+            divisions.find((d) => String(d.value) === String(id))?.text || id
         )
       );
     }
@@ -236,11 +234,19 @@ export default function ManageStats() {
           <Form.Group widths="equal">
             <Form.Field required>
               <label>Short ID (e.g. GI)</label>
-              <Input placeholder="GI" value={shortId} onChange={(e) => setShortId(e.target.value)} />
+              <Input
+                placeholder="GI"
+                value={shortId}
+                onChange={(e) => setShortId(e.target.value)}
+              />
             </Form.Field>
             <Form.Field required>
               <label>Full Name</label>
-              <Input placeholder="Gross Income" value={fullName} onChange={(e) => setFullName(e.target.value)} />
+              <Input
+                placeholder="Gross Income"
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+              />
             </Form.Field>
           </Form.Group>
 
@@ -251,7 +257,11 @@ export default function ManageStats() {
                 selection
                 options={[
                   { key: "personal", text: "Personal", value: "personal" },
-                  { key: "divisional", text: "Divisional", value: "divisional" },
+                  {
+                    key: "divisional",
+                    text: "Divisional",
+                    value: "divisional",
+                  },
                   { key: "main", text: "Main (Company)", value: "main" },
                 ]}
                 value={type}
@@ -266,7 +276,11 @@ export default function ManageStats() {
                 options={[
                   { key: "number", text: "Number", value: "number" },
                   { key: "currency", text: "Currency ($)", value: "currency" },
-                  { key: "percentage", text: "Percentage (%)", value: "percentage" },
+                  {
+                    key: "percentage",
+                    text: "Percentage (%)",
+                    value: "percentage",
+                  },
                 ]}
                 value={valueType}
                 onChange={(_, { value }) => setValueType(value)}
@@ -275,24 +289,15 @@ export default function ManageStats() {
 
             <Form.Field>
               <label>Reversed (upside-down)</label>
-              <Checkbox toggle checked={reversed} onChange={(_, { checked }) => setReversed(!!checked)} />
+              <Checkbox
+                toggle
+                checked={reversed}
+                onChange={(_, { checked }) => setReversed(!!checked)}
+              />
             </Form.Field>
           </Form.Group>
 
-          {/* Responsible is optional now */}
-          <Form.Field>
-            <label>Responsible</label>
-            <Dropdown
-              placeholder="Select responsible user (optional)"
-              fluid
-              selection
-              options={users}
-              value={responsibleUser}
-              onChange={(_, { value }) => setResponsibleUser(value)}
-              clearable
-            />
-          </Form.Field>
-
+          {/* Assign to Users */}
           <Form.Field>
             <label>Assign to Users</label>
             <Dropdown
@@ -306,25 +311,30 @@ export default function ManageStats() {
             />
           </Form.Field>
 
-          {type === "divisional" && (
-            <Form.Field>
-              <label>
-                Assign to Divisions{" "}
-                <Button basic size="tiny" onClick={() => setDivisionModalOpen(true)} icon>
-                  <Icon name="cogs" /> Manage
-                </Button>
-              </label>
-              <Dropdown
-                placeholder="Select divisions"
-                fluid
-                multiple
-                selection
-                options={divisions}
-                value={assignedDivs}
-                onChange={(_, { value }) => setAssignedDivs(value)}
-              />
-            </Form.Field>
-          )}
+          {/* Assign to Divisions (always visible) */}
+          <Form.Field>
+            <label>
+              Assign to Divisions{" "}
+              <Button
+                basic
+                size="tiny"
+                type="button" // <- important: prevents submitting the parent form
+                onClick={() => setDivisionModalOpen(true)}
+                icon
+              >
+                <Icon name="cogs" /> Manage
+              </Button>
+            </label>
+            <Dropdown
+              placeholder="Select divisions"
+              fluid
+              multiple
+              selection
+              options={divisions}
+              value={assignedDivs}
+              onChange={(_, { value }) => setAssignedDivs(value)}
+            />
+          </Form.Field>
 
           <Button primary type="submit">
             {editId ? "Update Stat" : "Create Stat"}
@@ -350,7 +360,6 @@ export default function ManageStats() {
               <Table.HeaderCell>Type</Table.HeaderCell>
               <Table.HeaderCell>Value Type</Table.HeaderCell>
               <Table.HeaderCell>Reversed</Table.HeaderCell>
-              <Table.HeaderCell>Responsible</Table.HeaderCell>
               <Table.HeaderCell>Assigned To</Table.HeaderCell>
               <Table.HeaderCell>Actions</Table.HeaderCell>
             </Table.Row>
@@ -365,15 +374,19 @@ export default function ManageStats() {
                 <Table.Cell>{s.type}</Table.Cell>
                 <Table.Cell>{s.value_type}</Table.Cell>
                 <Table.Cell>{s.reversed ? "Yes" : "No"}</Table.Cell>
-                <Table.Cell>
-                  {users.find((u) => String(u.value) === String(s.responsible_user_id))
-                    ? users.find((u) => String(u.value) === String(s.responsible_user_id)).text
-                    : s.responsible_user_id || "—"}
-                </Table.Cell>
                 <Table.Cell>{mapAssignedNames(s)}</Table.Cell>
                 <Table.Cell>
-                  <Button size="mini" icon="edit" onClick={() => startEdit(s)} />
-                  <Button size="mini" icon="trash" negative onClick={() => deleteStat(s.id, s.full_name)} />
+                  <Button
+                    size="mini"
+                    icon="edit"
+                    onClick={() => startEdit(s)}
+                  />
+                  <Button
+                    size="mini"
+                    icon="trash"
+                    negative
+                    onClick={() => deleteStat(s.id, s.full_name)}
+                  />
                 </Table.Cell>
               </Table.Row>
             ))}

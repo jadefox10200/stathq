@@ -43,15 +43,10 @@ func InitDB() {
 			name TEXT NOT NULL
 		);
 
-		-- Classifications (kept for legacy, but not used in new stats)
-		CREATE TABLE IF NOT EXISTS classifications (
-			name TEXT PRIMARY KEY
-		);
-
 		-- === STATS TABLE (only one!) ===
 		CREATE TABLE IF NOT EXISTS stats (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			short_id TEXT NOT NULL UNIQUE,           -- e.g. "GI"
+			short_id TEXT NOT NULL,           -- e.g. "GI"
 			full_name TEXT NOT NULL,                 -- e.g. "Gross Income"
 			type TEXT NOT NULL CHECK(type IN ('personal','divisional','main')),
 			value_type TEXT NOT NULL CHECK(value_type IN ('number','currency','percentage')),
@@ -76,22 +71,28 @@ func InitDB() {
 			FOREIGN KEY(division_id) REFERENCES divisions(id) ON DELETE CASCADE
 		);
 
-		-- Daily stats (legacy - kept for now)
+		-- Daily stats (user_id nullable; division_id nullable)
 		CREATE TABLE IF NOT EXISTS daily_stats (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
 			date TEXT NOT NULL,
 			value INTEGER NOT NULL,
-			division_id INTEGER NOT NULL
+			division_id INTEGER,
+			user_id INTEGER,
+			FOREIGN KEY (division_id) REFERENCES divisions(id),
+			FOREIGN KEY (user_id) REFERENCES users(id)
 		);
 
-		-- Weekly stats (legacy - kept for now)
+		-- Weekly stats (user_id nullable; division_id nullable)
 		CREATE TABLE IF NOT EXISTS weekly_stats (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
 			week_ending TEXT NOT NULL,
 			value INTEGER NOT NULL,
-			division_id INTEGER NOT NULL
+			division_id INTEGER,
+			user_id INTEGER,
+			FOREIGN KEY (division_id) REFERENCES divisions(id),
+			FOREIGN KEY (user_id) REFERENCES users(id)
 		);
 	`)
 	if err != nil {

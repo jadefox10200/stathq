@@ -51,41 +51,25 @@ export default function Header() {
           Home
         </NavLink>
         <NavLink
-          to="/inputDailyStats"
+          to="/inputStats"
           className={({ isActive }) => `item ${isActive ? "active" : ""}`}
         >
-          Input Daily Stats
+          Input Stats
         </NavLink>
         <NavLink
-          to="/inputWeeklyStats"
-          className={({ isActive }) => `item ${isActive ? "active" : ""}`}
-        >
-          Input Weekly Stats
-        </NavLink>
-        <NavLink
-          to="/viewDailyStats"
-          className={({ isActive }) => `item ${isActive ? "active" : ""}`}
-        >
-          View Daily Stats
-        </NavLink>
-        <NavLink
-          to="/viewWeeklyStats"
+          to="/viewStats"
           className={({ isActive }) => `item ${isActive ? "active" : ""}`}
         >
           View Weekly Stats
         </NavLink>
-        <NavLink
-          to="/editStatsView"
-          className={({ isActive }) => `item ${isActive ? "active" : ""}`}
-        >
-          Edit Stats
-        </NavLink>
-        <NavLink
-          to="/manageStats"
-          className={({ isActive }) => `item ${isActive ? "active" : ""}`}
-        >
-          Manage Stats
-        </NavLink>
+        {isAdmin && (
+          <NavLink
+            to="/manageStats"
+            className={({ isActive }) => `item ${isActive ? "active" : ""}`}
+          >
+            Manage Stats
+          </NavLink>
+        )}
         {isAdmin && (
           <NavLink
             to="/manage-users"

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,33 +34,26 @@ var (
 )
 
 // webFail – centralised error responder
-// msg: user-facing message
-// w: response writer
-// err: the actual error (optional)
-// data: any extra context (will be printed in logs)
 func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) {
-    // Log everything
-    if err != nil {
-        log.Printf("%s | data: %v | error: %v", msg, data, err)
-        fmt.Printf("%s | data: %v | error: %v\n", msg, data, err)
-    } else {
-        log.Printf("%s | data: %v", msg, data)
-        fmt.Printf("%s | data: %v\n", msg, data)
-    }
+	if err != nil {
+		log.Printf("%s | data: %v | error: %v", msg, data, err)
+		fmt.Printf("%s | data: %v | error: %v\n", msg, data, err)
+	} else {
+		log.Printf("%s | data: %v", msg, data)
+		fmt.Printf("%s | data: %v\n", msg, data)
+	}
+	type errResp struct {
+		Message string `json:"message"`
+		Details string `json:"details,omitempty"`
+	}
+	resp := errResp{Message: msg}
+	if err != nil {
+		resp.Details = err.Error()
+	}
 
-    // Build JSON response
-    type errResp struct {
-        Message string `json:"message"`
-        Details string `json:"details,omitempty"`
-    }
-    resp := errResp{Message: msg}
-    if err != nil {
-        resp.Details = err.Error()
-    }
-
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusInternalServerError) // default
-    json.NewEncoder(w).Encode(resp)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(resp)
 }
 
 // AuthMiddleware checks authentication and optionally role
@@ -101,7 +95,7 @@ func AuthMiddleware(requireRole string, next http.Handler) http.Handler {
 	})
 }
 
-// UserInfoHandler returns the current user's information
+// UserInfoHandler returns the current user's information including numeric id
 func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 	session, err := store.Get(r, "session-name")
 	if err != nil {
@@ -126,7 +120,8 @@ func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := map[string]string{
+	response := map[string]interface{}{
+		"id":         userID,
 		"company_id": companyID,
 		"username":   username,
 		"role":       role,
@@ -135,6 +130,540 @@ func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// ---------- LIST ASSIGNED STATS (for non-admin users) ----------
+func ListAssignedStatsHandler(w http.ResponseWriter, r *http.Request) {
+	uid := r.Context().Value("user_id").(int)
+
+	rows, err := DB.Query(`
+        SELECT 
+            s.id, 
+            s.short_id, 
+            s.full_name, 
+            s.type, 
+            s.value_type, 
+            s.reversed,
+            COALESCE(GROUP_CONCAT(DISTINCT sua.user_id), '') AS user_ids,
+            COALESCE(GROUP_CONCAT(DISTINCT sda.division_id), '') AS division_ids
+        FROM stats s
+        LEFT JOIN stat_user_assignments sua ON s.id = sua.stat_id
+        LEFT JOIN stat_division_assignments sda ON s.id = sda.stat_id
+        WHERE s.id IN (
+            SELECT stat_id FROM stat_user_assignments WHERE user_id = ?
+        )
+        GROUP BY s.id
+    `, uid)
+	if err != nil {
+		webFail("Failed to query assigned stats", w, err)
+		return
+	}
+	defer rows.Close()
+
+	type stat struct {
+		ID          int    `json:"id"`
+		ShortID     string `json:"short_id"`
+		FullName    string `json:"full_name"`
+		Type        string `json:"type"`
+		ValueType   string `json:"value_type"`
+		Reversed    bool   `json:"reversed"`
+		UserIDs     []int  `json:"user_ids"`
+		DivisionIDs []int  `json:"division_ids"`
+	}
+
+	var stats []stat
+
+	for rows.Next() {
+		var s stat
+		var uids, dids string
+		if err := rows.Scan(
+			&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
+			&uids, &dids,
+		); err != nil {
+			webFail("Failed to scan assigned stat row", w, err)
+			return
+		}
+		s.UserIDs = splitInt(uids)
+		s.DivisionIDs = splitInt(dids)
+		stats = append(stats, s)
+	}
+
+	if err = rows.Err(); err != nil {
+		webFail("Error iterating assigned stats", w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// ---------- SERVICES: DB-backed daily/weekly handlers ----------
+
+// Helper to parse int safely (for weekly/daily numeric fields)
+func parseIntLenient(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	i, err := strconv.Atoi(s)
+	return i, err
+}
+
+
+// GET /services/getDailyStats?date=<we>&stat=<name>
+// DB-backed version: returns JSON with Thursday/Friday/Monday/Tuesday/Wednesday/Quota like old CSV-based handler
+// ---------- Helper: resolve stat type and short id by stat_id or short_id ----------
+func resolveStatIdentity(statIDStr, statShort string) (resolvedShort string, resolvedType string, err error) {
+	// prefer stat_id if provided
+	if statIDStr != "" {
+		id, convErr := strconv.Atoi(statIDStr)
+		if convErr != nil {
+			return "", "", convErr
+		}
+		var shortID string
+		var stype string
+		q := `SELECT short_id, type FROM stats WHERE id = ? LIMIT 1`
+		if scanErr := DB.QueryRow(q, id).Scan(&shortID, &stype); scanErr != nil {
+			return "", "", scanErr
+		}
+		return strings.ToLower(shortID), stype, nil
+	}
+
+	// fallback to short id
+	if statShort != "" {
+		var stype string
+		q := `SELECT type FROM stats WHERE LOWER(short_id) = ? LIMIT 1`
+		if scanErr := DB.QueryRow(q, strings.ToLower(statShort)).Scan(&stype); scanErr != nil {
+			// not found -> default to personal (safe)
+			return strings.ToLower(statShort), "personal", nil
+		}
+		return strings.ToLower(statShort), stype, nil
+	}
+
+	return "", "", errors.New("either stat_id or stat (short id) must be provided")
+}
+
+// ---------- GET /services/getDailyStats (DB-backed, scoped by personal vs division), supports stat_id ----------
+// Update to handleGetDailyStats: format currency values correctly (convert stored cents to "500.00" style strings).
+// This replaces the previous handleGetDailyStats implementation to detect stat value_type and format returned daily values.
+
+func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	thisWeek := q.Get("date")
+	statIDStr := q.Get("stat_id")
+	statShort := q.Get("stat")
+
+	if thisWeek == "" || (statIDStr == "" && statShort == "") {
+		webFail("date and (stat_id or stat) are required", w, errors.New("missing params"))
+		return
+	}
+	if err := checkIfValidWE(thisWeek); err != nil {
+		webFail("Invalid W/E date", w, err)
+		return
+	}
+
+	// Resolve stat identity and metadata (prefer stat_id)
+	var nameLower, statType, valueType string
+	if statIDStr != "" {
+		id, err := strconv.Atoi(statIDStr)
+		if err != nil {
+			webFail("Invalid stat_id", w, err)
+			return
+		}
+		if err := DB.QueryRow(`SELECT short_id, type, value_type FROM stats WHERE id = ? LIMIT 1`, id).Scan(&nameLower, &statType, &valueType); err != nil {
+			if err == sql.ErrNoRows {
+				webFail("Stat not found", w, err)
+				return
+			}
+			webFail("Failed to query stat", w, err)
+			return
+		}
+		nameLower = strings.ToLower(nameLower)
+	} else {
+		// fallback to short id resolution (still support for legacy callers)
+		if err := DB.QueryRow(`SELECT short_id, type, value_type FROM stats WHERE LOWER(short_id) = ? LIMIT 1`, strings.ToLower(statShort)).Scan(&nameLower, &statType, &valueType); err != nil {
+			// If not found, treat as personal and default to string values
+			nameLower = strings.ToLower(statShort)
+			statType = "personal"
+			valueType = "number"
+		} else {
+			nameLower = strings.ToLower(nameLower)
+		}
+	}
+
+	// compute concrete dates (Thursday = thisWeek)
+	we, _ := time.Parse("2006-01-02", thisWeek)
+	dates := map[string]string{
+		"Thursday":  we.Format("2006-01-02"),
+		"Friday":    we.AddDate(0, 0, 1).Format("2006-01-02"),
+		"Monday":    we.AddDate(0, 0, 4).Format("2006-01-02"),
+		"Tuesday":   we.AddDate(0, 0, 5).Format("2006-01-02"),
+		"Wednesday": we.AddDate(0, 0, 6).Format("2006-01-02"),
+	}
+
+	// Prepare DailyStat response and format currency values if needed.
+	var rowDaily = DailyStat{
+		Name:  strings.ToUpper(nameLower),
+		Quota: "",
+	}
+
+	// session user id (for personal scope)
+	sessionUserID := r.Context().Value("user_id").(int)
+
+	for day, dateStr := range dates {
+		// Query the stored integer value (assumed stored as integer; for currency it's cents)
+		var v sql.NullInt64
+		var err error
+		if statType == "personal" {
+			err = DB.QueryRow(`SELECT value FROM daily_stats WHERE LOWER(name)=? AND date=? AND user_id=? LIMIT 1`, nameLower, dateStr, sessionUserID).Scan(&v)
+		} else {
+			// divisional/main: look for division-level row (as before)
+			err = DB.QueryRow(`SELECT value FROM daily_stats WHERE LOWER(name)=? AND date=? AND division_id IS NOT NULL LIMIT 1`, nameLower, dateStr).Scan(&v)
+		}
+		if err != nil && err != sql.ErrNoRows {
+			webFail("Failed to query daily_stats", w, err)
+			return
+		}
+		if !v.Valid {
+			// leave empty string for missing values
+			continue
+		}
+
+		// Format depending on value_type
+		switch valueType {
+		case "currency":
+			// v.Int64 is cents (stored as integer); convert to USD and string like "500.00"
+			usd := USD(v.Int64)
+			// USD.String uses cents -> formatted dollars with two decimals
+			formatted := usd.String()
+			switch day {
+			case "Thursday":
+				rowDaily.Thursday = formatted
+			case "Friday":
+				rowDaily.Friday = formatted
+			case "Monday":
+				rowDaily.Monday = formatted
+			case "Tuesday":
+				rowDaily.Tuesday = formatted
+			case "Wednesday":
+				rowDaily.Wednesday = formatted
+			}
+		default:
+			// For number/percentage (or unknown), return plain integer string
+			s := fmt.Sprintf("%d", v.Int64)
+			switch day {
+			case "Thursday":
+				rowDaily.Thursday = s
+			case "Friday":
+				rowDaily.Friday = s
+			case "Monday":
+				rowDaily.Monday = s
+			case "Tuesday":
+				rowDaily.Tuesday = s
+			case "Wednesday":
+				rowDaily.Wednesday = s
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rowDaily)
+}
+
+// ---------- POST /services/save7R (DB-backed), accepts stat_id or stat short id ----------
+// Replace the handleSave7R implementation in main.go with this version.
+// This version REQUIRES StatID to be provided per row and will NOT fall back to Name/short_id.
+// It resolves the stat by id to determine its type (personal/divisional/main) and scopes deletes/inserts accordingly.
+
+// Updated handleSave7R: requires StatID per row and uses statType directly (no unused vars).
+func handleSave7R(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	thisWeek := q.Get("thisWeek")
+	if thisWeek == "" {
+		webFail("thisWeek query param required", w, errors.New("missing thisWeek"))
+		return
+	}
+	if err := checkIfValidWE(thisWeek); err != nil {
+		webFail("Invalid W/E date", w, err)
+		return
+	}
+
+	// Decode incoming JSON; expect array of objects each with a required StatID
+	var rawRows []map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&rawRows); err != nil {
+		webFail("Failed to decode body", w, err)
+		return
+	}
+
+	type Row struct {
+		StatID    int
+		Name      string
+		Thursday  string
+		Friday    string
+		Monday    string
+		Tuesday   string
+		Wednesday string
+		Quota     string
+	}
+	rows := make([]Row, 0, len(rawRows))
+
+	for idx, rr := range rawRows {
+		rw := Row{}
+		v, ok := rr["StatID"]
+		if !ok || v == nil {
+			webFail(fmt.Sprintf("Missing StatID in payload row %d", idx), w, errors.New("StatID required"))
+			return
+		}
+		switch vv := v.(type) {
+		case float64:
+			rw.StatID = int(vv)
+		case int:
+			rw.StatID = vv
+		case string:
+			id, err := strconv.Atoi(vv)
+			if err != nil {
+				webFail(fmt.Sprintf("Invalid StatID value in row %d", idx), w, err)
+				return
+			}
+			rw.StatID = id
+		default:
+			webFail(fmt.Sprintf("Invalid StatID type in row %d", idx), w, errors.New("invalid StatID"))
+			return
+		}
+		if n, ok := rr["Name"].(string); ok {
+			rw.Name = n
+		}
+		if t, ok := rr["Thursday"].(string); ok {
+			rw.Thursday = t
+		}
+		if t, ok := rr["Friday"].(string); ok {
+			rw.Friday = t
+		}
+		if t, ok := rr["Monday"].(string); ok {
+			rw.Monday = t
+		}
+		if t, ok := rr["Tuesday"].(string); ok {
+			rw.Tuesday = t
+		}
+		if t, ok := rr["Wednesday"].(string); ok {
+			rw.Wednesday = t
+		}
+		if qv, ok := rr["Quota"].(string); ok {
+			rw.Quota = qv
+		}
+		rows = append(rows, rw)
+	}
+
+	// Validate rows using existing validateDailyStats (or your improved validator)
+	// After decoding rows into []Row (where Row.StatID is required), validate using stat metadata:
+	for _, v := range rows {
+		// resolve stat metadata by id (no fallback)
+		var shortID, valueType, statType string
+		err := DB.QueryRow(`SELECT short_id, value_type, type FROM stats WHERE id = ? LIMIT 1`, v.StatID).Scan(&shortID, &valueType, &statType)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				webFail(fmt.Sprintf("Stat not found for StatID %d", v.StatID), w, err)
+				return
+			}
+			webFail("Failed to query stat metadata", w, err)
+			return
+		}
+
+		// build DailyStat for validation
+		ds := DailyStat{
+			Name:      shortID,
+			Thursday:  v.Thursday,
+			Friday:    v.Friday,
+			Monday:    v.Monday,
+			Tuesday:   v.Tuesday,
+			Wednesday: v.Wednesday,
+			Quota:     v.Quota,
+		}
+
+		if err := validateDailyStatByType(shortID, valueType, ds); err != nil {
+			webFail("Validation failed for daily stat", w, err)
+			return
+		}
+	
+	}
+
+	tx, err := DB.Begin()
+	if err != nil {
+		webFail("Failed to start transaction", w, err)
+		return
+	}
+
+	we, _ := time.Parse("2006-01-02", thisWeek)
+	dates := map[string]string{
+		"Thursday":  we.Format("2006-01-02"),
+		"Friday":    we.AddDate(0, 0, 1).Format("2006-01-02"),
+		"Monday":    we.AddDate(0, 0, 4).Format("2006-01-02"),
+		"Tuesday":   we.AddDate(0, 0, 5).Format("2006-01-02"),
+		"Wednesday": we.AddDate(0, 0, 6).Format("2006-01-02"),
+	}
+
+	sessionUserID := r.Context().Value("user_id").(int)
+
+	for _, row := range rows {
+		// Resolve stat by ID (no fallback)
+		var shortID string
+		var statType string
+		if err := DB.QueryRow(`SELECT short_id, type FROM stats WHERE id = ? LIMIT 1`, row.StatID).Scan(&shortID, &statType); err != nil {
+			if err == sql.ErrNoRows {
+				tx.Rollback()
+				webFail(fmt.Sprintf("Stat not found for StatID %d", row.StatID), w, err)
+				return
+			}
+			tx.Rollback()
+			webFail("Failed to look up stat by StatID", w, err)
+			return
+		}
+		nameLower := strings.ToLower(shortID)
+
+		// Only support personal writes via this endpoint (safer). Reject divisional/main writes here.
+		if statType != "personal" {
+			tx.Rollback()
+			webFail(fmt.Sprintf("Stat %s (id=%d) is not a personal stat and cannot be written via this endpoint", shortID, row.StatID), w, errors.New("invalid stat scope"))
+			return
+		}
+
+		// Delete existing rows for this user and stat name for the week
+		if _, err := tx.Exec(`DELETE FROM daily_stats WHERE LOWER(name)=? AND date IN (?,?,?,?,?) AND user_id = ?`, nameLower, dates["Thursday"], dates["Friday"], dates["Monday"], dates["Tuesday"], dates["Wednesday"], sessionUserID); err != nil {
+			tx.Rollback()
+			webFail("Failed to clear existing personal daily rows", w, err)
+			return
+		}
+
+		dayValues := map[string]string{
+			"Thursday":  row.Thursday,
+			"Friday":    row.Friday,
+			"Monday":    row.Monday,
+			"Tuesday":   row.Tuesday,
+			"Wednesday": row.Wednesday,
+		}
+		for day, raw := range dayValues {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			valueInt := 0
+			if m, err := StringToMoney(raw); err == nil {
+				valueInt = int(m.MoneyToUSD())
+			} else {
+				if i, err := strconv.Atoi(raw); err == nil {
+					valueInt = i
+				} else {
+					tx.Rollback()
+					webFail(fmt.Sprintf("Invalid numeric value for stat %d on %s: %s", row.StatID, day, raw), w, errors.New("invalid numeric"))
+					return
+				}
+			}
+			dateStr := dates[day]
+			if _, err := tx.Exec(`INSERT INTO daily_stats (name, date, value, user_id) VALUES (?, ?, ?, ?)`, nameLower, dateStr, valueInt, sessionUserID); err != nil {
+				tx.Rollback()
+				webFail("Failed to insert personal daily row", w, err)
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		webFail("Failed to commit daily rows", w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message":"Saved 7R grid"}`)
+}
+
+// The rest of main() remains unchanged except for wiring the new handlers
+//
+func main() {
+	f := CreateLog()
+	defer f.Close()
+
+	InitDB()
+
+	store = sessions.NewCookieStore([]byte("super-secret-key"))
+	store.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600 * 8,
+		HttpOnly: true,
+		Secure:   false,
+	}
+
+	router := mux.NewRouter()
+
+	corsMiddleware := handlers.CORS(
+		handlers.AllowedOrigins([]string{"http://localhost:3000"}),
+		handlers.AllowedMethods([]string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}),
+		handlers.AllowedHeaders([]string{"Content-Type"}),
+		handlers.AllowCredentials(),
+	)
+
+	// services endpoints - use DB-backed handlers
+	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleGetWeeklyStats)))
+	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleGetDailyStats)))
+	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
+	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
+	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
+
+	// Admin-only endpoints
+	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
+	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
+	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
+	router.Handle("/api/users/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteUserHandler)))
+	router.Handle("/api/users/{id}/role", AuthMiddleware("admin", http.HandlerFunc(UpdateUserRoleHandler)))
+	router.Handle("/api/stats", AuthMiddleware("admin", http.HandlerFunc(CreateStatHandler))).Methods("POST")
+	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(UpdateStatHandler))).Methods("PATCH")
+	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteStatHandler))).Methods("DELETE")
+	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
+	// NEW: assigned stats endpoint for non-admin users
+	router.Handle("/api/stats/assigned", AuthMiddleware("", http.HandlerFunc(ListAssignedStatsHandler))).Methods("GET")
+
+	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
+	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
+	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
+
+	// User info endpoint
+	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
+
+	// Change password endpoint (for any authenticated user)
+	router.Handle("/api/change-password", AuthMiddleware("", http.HandlerFunc(ChangePasswordHandler)))
+
+	// Auth endpoints (unprotected)
+	router.HandleFunc("/login", LoginHandler)
+	router.HandleFunc("/logout", LogoutHandler)
+	router.HandleFunc("/register", RegisterHandler)
+
+	// Static file handlers left as-is
+	cssHandler := http.FileServer(http.Dir("public/css"))
+	router.PathPrefix("/public/css/").Handler(http.StripPrefix("/public/css", addHeaders(cssHandler, "text/css", "public/css")))
+
+	jsHandler := http.FileServer(http.Dir("public/js"))
+	router.PathPrefix("/public/js/").Handler(http.StripPrefix("/public/js", addHeaders(jsHandler, "application/javascript", "public/js")))
+
+	semanticHandler := http.FileServer(http.Dir("public/Semantic-UI-2.3.0/dist"))
+	router.PathPrefix("/public/Semantic-UI-2.3.0/dist/").Handler(http.StripPrefix("/public/Semantic-UI-2.3.0/dist", addHeaders(semanticHandler, "", "public/Semantic-UI-2.3.0/dist")))
+
+	videoHandler := http.FileServer(http.Dir("public/AV"))
+	router.PathPrefix("/public/AV/").Handler(http.StripPrefix("/public/AV", addHeaders(videoHandler, "video/mp4", "public/AV")))
+
+	publicHandler := http.FileServer(http.Dir("public"))
+	router.PathPrefix("/public/").Handler(http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
+
+	router.PathPrefix("/").HandlerFunc(handleIndex)
+
+	http.Handle("/", corsMiddleware(router))
+
+	port := ":9090"
+	fmt.Printf("Running Stat HQ on %s\n", port)
+	log.Fatal(http.ListenAndServe(port, nil))
+}
+
+// (other functions in the file remain unchanged; only handlers above were added/modified)
 // ---------- CREATE STAT ----------
 func CreateStatHandler(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodPost {
@@ -340,11 +869,15 @@ func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
             s.type, 
             s.value_type, 
             s.reversed,
+			u.username,
+			d.name as div_name,
             COALESCE(GROUP_CONCAT(DISTINCT sua.user_id), '') AS user_ids,
             COALESCE(GROUP_CONCAT(DISTINCT sda.division_id), '') AS division_ids
         FROM stats s
         LEFT JOIN stat_user_assignments sua ON s.id = sua.stat_id
+		LEFT JOIN users u ON sua.user_id = u.id
         LEFT JOIN stat_division_assignments sda ON s.id = sda.stat_id
+		LEFT JOIN divisions d ON sda.division_id = d.id
         GROUP BY s.id
     `)
     if err != nil {
@@ -360,6 +893,8 @@ func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
         Type        string `json:"type"`
         ValueType   string `json:"value_type"`
         Reversed    bool   `json:"reversed"`
+		UserName    string  `json:"username"`
+		DivName    string   `json:"div_name"`
         UserIDs     []int  `json:"user_ids"`
         DivisionIDs []int  `json:"division_ids"`
     }
@@ -370,7 +905,7 @@ func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
         var s stat
         var uids, dids string // will be "" if no assignments
         if err := rows.Scan(
-            &s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
+            &s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,&s.UserName,&s.DivName,
             &uids, &dids,
         ); err != nil {
             webFail("Failed to scan stat row", w, err)
@@ -768,85 +1303,85 @@ func UserHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 
-func main() {
-	f := CreateLog()
-	defer f.Close()
+// func main() {
+// 	f := CreateLog()
+// 	defer f.Close()
 
-	InitDB()
+// 	InitDB()
 
-	store = sessions.NewCookieStore([]byte("super-secret-key"))
-	store.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   3600 * 8,
-		HttpOnly: true,
-		Secure:   false,
-	}
+// 	store = sessions.NewCookieStore([]byte("super-secret-key"))
+// 	store.Options = &sessions.Options{
+// 		Path:     "/",
+// 		MaxAge:   3600 * 8,
+// 		HttpOnly: true,
+// 		Secure:   false,
+// 	}
 
-	router := mux.NewRouter()
+// 	router := mux.NewRouter()
 
-	corsMiddleware := handlers.CORS(
-		handlers.AllowedOrigins([]string{"http://localhost:3000"}),
-		handlers.AllowedMethods([]string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}),
-		handlers.AllowedHeaders([]string{"Content-Type"}),
-		handlers.AllowCredentials(),
-	)
+// 	corsMiddleware := handlers.CORS(
+// 		handlers.AllowedOrigins([]string{"http://localhost:3000"}),
+// 		handlers.AllowedMethods([]string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}),
+// 		handlers.AllowedHeaders([]string{"Content-Type"}),
+// 		handlers.AllowCredentials(),
+// 	)
 
-	// services endpoints
-	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleWeeklyStatsRequest)))
-	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleDailyStatsRequest)))
-	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
-	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
-	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
+// 	// services endpoints
+// 	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleWeeklyStatsRequest)))
+// 	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleDailyStatsRequest)))
+// 	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
+// 	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
+// 	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
 
-	// Admin-only endpoints
-	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
-	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
-	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
-	router.Handle("/api/users/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteUserHandler)))
-	router.Handle("/api/users/{id}/role", AuthMiddleware("admin", http.HandlerFunc(UpdateUserRoleHandler)))
-	router.Handle("/api/stats", AuthMiddleware("admin", http.HandlerFunc(CreateStatHandler))).Methods("POST")
-	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(UpdateStatHandler))).Methods("PATCH")
-	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteStatHandler))).Methods("DELETE")
-	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
-	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
-	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
-	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
+// 	// Admin-only endpoints
+// 	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
+// 	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
+// 	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
+// 	router.Handle("/api/users/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteUserHandler)))
+// 	router.Handle("/api/users/{id}/role", AuthMiddleware("admin", http.HandlerFunc(UpdateUserRoleHandler)))
+// 	router.Handle("/api/stats", AuthMiddleware("admin", http.HandlerFunc(CreateStatHandler))).Methods("POST")
+// 	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(UpdateStatHandler))).Methods("PATCH")
+// 	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteStatHandler))).Methods("DELETE")
+// 	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
+// 	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
+// 	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
+// 	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
 
-	// User info endpoint
-	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
+// 	// User info endpoint
+// 	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
 
-	// Change password endpoint (for any authenticated user)
-	router.Handle("/api/change-password", AuthMiddleware("", http.HandlerFunc(ChangePasswordHandler)))
+// 	// Change password endpoint (for any authenticated user)
+// 	router.Handle("/api/change-password", AuthMiddleware("", http.HandlerFunc(ChangePasswordHandler)))
 	
-	// Auth endpoints (unprotected)
-	router.HandleFunc("/login", LoginHandler)
-	router.HandleFunc("/logout", LogoutHandler)
-	router.HandleFunc("/register", RegisterHandler)
+// 	// Auth endpoints (unprotected)
+// 	router.HandleFunc("/login", LoginHandler)
+// 	router.HandleFunc("/logout", LogoutHandler)
+// 	router.HandleFunc("/register", RegisterHandler)
 
-	// Static file handlers
-	cssHandler := http.FileServer(http.Dir("public/css"))
-	router.PathPrefix("/public/css/").Handler(http.StripPrefix("/public/css", addHeaders(cssHandler, "text/css", "public/css")))
+// 	// Static file handlers
+// 	cssHandler := http.FileServer(http.Dir("public/css"))
+// 	router.PathPrefix("/public/css/").Handler(http.StripPrefix("/public/css", addHeaders(cssHandler, "text/css", "public/css")))
 
-	jsHandler := http.FileServer(http.Dir("public/js"))
-	router.PathPrefix("/public/js/").Handler(http.StripPrefix("/public/js", addHeaders(jsHandler, "application/javascript", "public/js")))
+// 	jsHandler := http.FileServer(http.Dir("public/js"))
+// 	router.PathPrefix("/public/js/").Handler(http.StripPrefix("/public/js", addHeaders(jsHandler, "application/javascript", "public/js")))
 
-	semanticHandler := http.FileServer(http.Dir("public/Semantic-UI-2.3.0/dist"))
-	router.PathPrefix("/public/Semantic-UI-2.3.0/dist/").Handler(http.StripPrefix("/public/Semantic-UI-2.3.0/dist", addHeaders(semanticHandler, "", "public/Semantic-UI-2.3.0/dist")))
+// 	semanticHandler := http.FileServer(http.Dir("public/Semantic-UI-2.3.0/dist"))
+// 	router.PathPrefix("/public/Semantic-UI-2.3.0/dist/").Handler(http.StripPrefix("/public/Semantic-UI-2.3.0/dist", addHeaders(semanticHandler, "", "public/Semantic-UI-2.3.0/dist")))
 
-	videoHandler := http.FileServer(http.Dir("public/AV"))
-	router.PathPrefix("/public/AV/").Handler(http.StripPrefix("/public/AV", addHeaders(videoHandler, "video/mp4", "public/AV")))
+// 	videoHandler := http.FileServer(http.Dir("public/AV"))
+// 	router.PathPrefix("/public/AV/").Handler(http.StripPrefix("/public/AV", addHeaders(videoHandler, "video/mp4", "public/AV")))
 
-	publicHandler := http.FileServer(http.Dir("public"))
-	router.PathPrefix("/public/").Handler(http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
+// 	publicHandler := http.FileServer(http.Dir("public"))
+// 	router.PathPrefix("/public/").Handler(http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
 
-	router.PathPrefix("/").HandlerFunc(handleIndex)
+// 	router.PathPrefix("/").HandlerFunc(handleIndex)
 
-	http.Handle("/", corsMiddleware(router))
+// 	http.Handle("/", corsMiddleware(router))
 
-	port := ":9090"
-	fmt.Printf("Running Stat HQ on %s\n", port)
-	log.Fatal(http.ListenAndServe(port, nil))
-}
+// 	port := ":9090"
+// 	fmt.Printf("Running Stat HQ on %s\n", port)
+// 	log.Fatal(http.ListenAndServe(port, nil))
+// }
 
 // ---------- LIST ALL DIVISIONS ----------
 func ListDivisionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1600,65 +2135,65 @@ func CumWeekFloat(args ...string) (float64, error) {
 	return d.Float64(), nil
 }
 
-func handleSave7R(w http.ResponseWriter, r *http.Request) {
+// func handleSave7R(w http.ResponseWriter, r *http.Request) {
 
-	statGrid := make([]DailyStat, 3)
+// 	statGrid := make([]DailyStat, 3)
 
-	err := json.NewDecoder(r.Body).Decode(&statGrid)
-	if err != nil {
-		msg := "Failed to decode body"
-		webFail(msg, w, err)
-		return
-	}
+// 	err := json.NewDecoder(r.Body).Decode(&statGrid)
+// 	if err != nil {
+// 		msg := "Failed to decode body"
+// 		webFail(msg, w, err)
+// 		return
+// 	}
 
-	fmt.Println(statGrid)
+// 	fmt.Println(statGrid)
 
-	for _, v := range statGrid {
-		err = validateDailyStats(v)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-	}
+// 	for _, v := range statGrid {
+// 		err = validateDailyStats(v)
+// 		if err != nil {
+// 			webFail("", w, err)
+// 			return
+// 		}
+// 	}
 
-	q := r.URL.Query()
-	thisWeek := q.Get("thisWeek")
+// 	q := r.URL.Query()
+// 	thisWeek := q.Get("thisWeek")
 
-	err = checkIfValidWE(thisWeek)
-	if err != nil {
-		msg := "The weekending date is not valid or is not Thursday"
-		webFail(msg, w, err)
-		return
-	}
+// 	err = checkIfValidWE(thisWeek)
+// 	if err != nil {
+// 		msg := "The weekending date is not valid or is not Thursday"
+// 		webFail(msg, w, err)
+// 		return
+// 	}
 
-	fileName := fmt.Sprintf("public/dailyStats/%s.csv", thisWeek)
+// 	fileName := fmt.Sprintf("public/dailyStats/%s.csv", thisWeek)
 
-	err = os.Remove(fileName)
-	if err != nil {
-		msg := "Failed to delete a file which makes it impossible to save"
-		webFail(msg, w, err)
-		return
-	}
+// 	err = os.Remove(fileName)
+// 	if err != nil {
+// 		msg := "Failed to delete a file which makes it impossible to save"
+// 		webFail(msg, w, err)
+// 		return
+// 	}
 
-	file, err := os.Create(fileName)
-	if err != nil {
-		msg := fmt.Sprintf("Failed to create file %s", fileName)
-		webFail(msg, w, err)
-		return
-	}
+// 	file, err := os.Create(fileName)
+// 	if err != nil {
+// 		msg := fmt.Sprintf("Failed to create file %s", fileName)
+// 		webFail(msg, w, err)
+// 		return
+// 	}
 
-	err = gocsv.MarshalFile(statGrid, file)
-	if err != nil {
-		msg := "Failed to marshal the file"
-		webFail(msg, w, err)
-		return
-	}
+// 	err = gocsv.MarshalFile(statGrid, file)
+// 	if err != nil {
+// 		msg := "Failed to marshal the file"
+// 		webFail(msg, w, err)
+// 		return
+// 	}
 
-	msg := "Saved 7R grid"
-	io.WriteString(w, msg)
+// 	msg := "Saved 7R grid"
+// 	io.WriteString(w, msg)
 
-	return
-}
+// 	return
+// }
 
 // func addHeaders(fs http.Handler) http.HandlerFunc {
 // 	return func(w http.ResponseWriter, r *http.Request) {
@@ -2002,140 +2537,6 @@ func (m *Money) MoneyToUSD() USD {
 	return USD(c)
 }
 
-func handleLogWeeklyStats(w http.ResponseWriter, r *http.Request) {
-
-	// get stat values from the submitted form
-	date := r.FormValue("date")
-	err := checkIfValidWE(date)
-	if err != nil {
-		msg := "The weekending date is not valid or is not Thursday"
-		webFail(msg, w, err)
-		return
-	}
-
-	vsd := r.FormValue("vsd")
-	vsdMoney, err := StringToMoney(vsd)
-	if err != nil || vsd == "" {
-		msg := "The VSD value entered does not appear to be a valid number or you didn't enter anything. Please do not use any other symbols other than a decimal."
-		webFail(msg, w, err)
-		return
-	}
-	vsdPennies := vsdMoney.MoneyToUSD()
-
-	gi := r.FormValue("gi")
-	giMoney, err := StringToMoney(gi)
-	if err != nil || gi == "" {
-		msg := "The GI value entered does not appear to be a valid number or you didn't enter anything. Please do not use any other symbols other than a decimal."
-		webFail(msg, w, err)
-		return
-	}
-	giPennies := giMoney.MoneyToUSD()
-
-	sites := r.FormValue("sites")
-	_, err = strconv.Atoi(sites)
-	if err != nil || sites == "" {
-		msg := "The Job Sites value entered does not appear to be a valid number or you didn't enter anything."
-		webFail(msg, w, err)
-		return
-	}
-
-	expenses := r.FormValue("expenses")
-	expensesMoney, err := StringToMoney(expenses)
-	if err != nil || expenses == "" {
-		msg := "The Expenses value entered does not appear to be a valid number or you didn't enter anything. Please do not use any other symbols other than a decimal."
-		webFail(msg, w, err)
-		return
-	}
-	expensesPennies := expensesMoney.MoneyToUSD()
-
-	scheduled := r.FormValue("scheduled")
-	_, err = strconv.Atoi(sites)
-	if err != nil || scheduled == "" {
-		msg := "The Job Sites value entered does not appear to be a valid number or you didn't enter anything."
-		webFail(msg, w, err)
-		return
-	}
-
-	outstanding := r.FormValue("outstanding")
-	outstandingMoney, err := StringToMoney(outstanding)
-	if err != nil || outstanding == "" {
-		msg := "The Outstanding value entered does not appear to be a valid number or you didn't enter anything. Please do not use any other symbols other than a decimal."
-		webFail(msg, w, err)
-		return
-	}
-	outstandingPennies := outstandingMoney.MoneyToUSD()
-
-	b, err := FileExists("public/stats/weekly.csv")
-	if err != nil {
-		msg := "Couldn't verify if weekly.csv exists"
-		webFail(msg, w, err)
-		return
-	}
-
-	if !b {
-		_, err := os.Create("public/stats/weekly.csv")
-		if err != nil {
-			msg := "Failed to create weekly.csv file"
-			webFail(msg, w, err)
-			return
-		}
-
-		_, err = copyFile("public/stats/template.csv", "public/stats/weekly.csv")
-		if err != nil {
-			webFail("Failed to copy template to weekly.csv", w, err)
-			return
-		}
-	}
-
-	f, err := os.OpenFile("public/stats/weekly.csv", os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		log.Fatalf("ERROR: error opening file: %v", err)
-	}
-	defer f.Close()
-
-	line := fmt.Sprintf("%v,%v,%v,%v,%v,%v,%v\n", date, gi, vsd, expenses, scheduled, sites, outstanding)
-	_, err = io.WriteString(f, line)
-	if err != nil {
-		webFail("Failed to write to weekly.csv", w, err)
-		return
-	}
-
-	// err = errors.New("Custom error message")
-	// webFail("testing a failed", w, err, nil)
-	msg := fmt.Sprintf("The following data was logged:\r\nGI: %v\r\nVSD: %v\r\nJobs: %v\r\nExpenses: %v\r\nScheduled: %v\r\nOutstanding Collections: %v\r\n", giPennies.String(), vsdPennies.String(), sites, expensesPennies.String(), scheduled, outstandingPennies.String())
-	io.WriteString(w, msg)
-
-	return
-}
-
-// webFail will print to the standard logger as well as stdout the msg string. The arg 'data' will be appended
-// to show the data that caused the error and the error will also be printed out to these.
-// This call http.Error and sends only the msg back to the client.
-// func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) {
-// 	fullMsg := msg
-// 	if err != nil {
-// 		fullMsg += ": " + err.Error()
-// 	}
-// 	log.Println(msg, " : ", data, " with error: ", err)
-// 	fmt.Println(msg, " : ", data, " with error: ", err)
-// 	http.Error(w, fullMsg, 500)
-// 	return
-// }
-
-// Creates the log.txt which will log activity (mostly used for error logging). This appends all new data to the file.
-func CreateLog() *os.File {
-
-	//CREATE ERROR LOG:
-	f, err := os.OpenFile("ErrorLog.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		log.Fatalf("ERROR: error opening file: %v", err)
-	}
-
-	log.SetOutput(f)
-
-	return f
-
-}
 
 // change this so it is simply a generic template loader:
 func handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -2215,56 +2616,6 @@ func RenderEditWeekly(w http.ResponseWriter, r *http.Request, name string) {
 	}{statSlice}
 
 	renderTemplate(w, r, name, data)
-
-	return
-}
-
-func handleSaveWeeklyEdit(w http.ResponseWriter, r *http.Request) {
-
-	statGrid := make([]SingleWeeklyStat, 0)
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		webFail("Failed to read r.Body", w, err)
-		return
-	}
-
-	err = json.Unmarshal(body, &statGrid)
-	if err != nil {
-		webFail("Failed to unmarshal body", w, err)
-		return
-	}
-
-	//verify all data:
-	for _, v := range statGrid {
-		date := strings.TrimSpace(v.WeekEnding)
-		err = checkIfValidWE(date)
-		if err != nil {
-			msg := fmt.Sprintf("W/E date %s invalid", v.WeekEnding)
-			webFail(msg, w, err)
-			return
-		}
-	}
-
-	err = os.Remove("public/stats/weekly.csv")
-	if err != nil {
-		webFail("Failed to remove weekly.csv as part of update. The update did not take place", w, err)
-		return
-	}
-
-	f, err := os.Create("public/stats/weekly.csv")
-	if err != nil {
-		webFail("Failed to create weekly.csv", w, err)
-		return
-	}
-
-	err = gocsv.MarshalFile(statGrid, f)
-	if err != nil {
-		webFail("Failed to marshal statGrid into weekly.csv", w, err)
-		return
-	}
-
-	io.WriteString(w, "Saved Weekly stat data")
 
 	return
 }
@@ -2469,3 +2820,527 @@ func renderTemplate(w http.ResponseWriter, r *http.Request, name string, data in
 }
 
 // ... (rest of the code: CreateLog, FileExists, DailyStat, validateDailyStats, StringToMoney, getWeeks, checkIfValidWE, webFail, handleClassifications, handleDivisions, handleStats, handleDailyStatsRequest, handleWeeklyStatsRequest, handleSave7R, handleLogWeeklyStats, handleSaveWeeklyEdit remain unchanged from artifact version 54392640-368e-42c1-b319-d3e4ba07984e)
+// Creates the log.txt which will log activity (mostly used for error logging). This appends all new data to the file.
+func CreateLog() *os.File {
+
+	//CREATE ERROR LOG:
+	f, err := os.OpenFile("ErrorLog.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("ERROR: error opening file: %v", err)
+	}
+
+	log.SetOutput(f)
+
+	return f
+
+}
+
+// ---------- POST /services/logWeeklyStats ----------
+// Minimal StatID-based single write endpoint. Accepts form-encoded or JSON:
+// - form: stat_id=<id>&date=<YYYY-MM-DD>&value=<string>
+// - JSON: { "stat_id": <id>, "date": "YYYY-MM-DD", "value": "<string>" }
+func handleLogWeeklyStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Support JSON or form body
+	var statID int
+	var date string
+	var value string
+	ct := r.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "application/json") {
+		var payload struct {
+			StatID int    `json:"stat_id"`
+			Date   string `json:"date"`
+			Value  string `json:"value"`
+		}
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			webFail("Failed to read request body", w, err)
+			return
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			webFail("Failed to parse JSON", w, err)
+			return
+		}
+		statID = payload.StatID
+		date = payload.Date
+		value = payload.Value
+	} else {
+		// form
+		if err := r.ParseForm(); err != nil {
+			webFail("Failed to parse form", w, err)
+			return
+		}
+		statID, _ = strconv.Atoi(r.FormValue("stat_id"))
+		date = r.FormValue("date")
+		value = r.FormValue("value")
+	}
+
+	if statID == 0 {
+		webFail("stat_id is required", w, fmt.Errorf("stat_id required"))
+		return
+	}
+	if err := checkIfValidWE(date); err != nil {
+		webFail("The weekending date is not valid or is not Thursday", w, err)
+		return
+	}
+
+	// Resolve stat metadata
+	var shortID, valueType, statType string
+	if err := DB.QueryRow(`SELECT short_id, value_type, type FROM stats WHERE id = ? LIMIT 1`, statID).Scan(&shortID, &valueType, &statType); err != nil {
+		if err == sql.ErrNoRows {
+			webFail("Stat not found", w, err)
+			return
+		}
+		webFail("Failed to query stat metadata", w, err)
+		return
+	}
+	if statType != "personal" {
+		webFail("Only personal stats can be written via this endpoint", w, fmt.Errorf("invalid stat scope"))
+		return
+	}
+
+	// validate value according to valueType
+	if err := validateWeeklyValueByType(value, valueType); err != nil {
+		webFail("Invalid value", w, err)
+		return
+	}
+
+	// convert to storage integer
+	var storeVal int64
+	switch valueType {
+	case "currency":
+		m, err := StringToMoney(value)
+		if err != nil {
+			webFail("Invalid currency", w, err)
+			return
+		}
+		storeVal = int64(m.MoneyToUSD())
+	case "number":
+		i, err := strconv.Atoi(value)
+		if err != nil {
+			webFail("Invalid integer", w, err)
+			return
+		}
+		storeVal = int64(i)
+	case "percentage":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			webFail("Invalid percentage", w, err)
+			return
+		}
+		storeVal = int64((f * 100) + 0.5)
+	default:
+		webFail("Unknown value type", w, fmt.Errorf("value_type=%s", valueType))
+		return
+	}
+
+	// Insert: remove existing personal row for this stat/date/user then insert
+	tx, err := DB.Begin()
+	if err != nil {
+		webFail("Failed to start transaction", w, err)
+		return
+	}
+	sessionUserID := r.Context().Value("user_id").(int)
+
+	if _, err := tx.Exec(`DELETE FROM weekly_stats WHERE LOWER(name)=? AND week_ending = ? AND user_id = ?`, strings.ToLower(shortID), date, sessionUserID); err != nil {
+		tx.Rollback()
+		webFail("Failed to clear existing weekly row", w, err)
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO weekly_stats (name, week_ending, value, user_id) VALUES (?, ?, ?, ?)`, strings.ToLower(shortID), date, storeVal, sessionUserID); err != nil {
+		tx.Rollback()
+		webFail("Failed to insert weekly row", w, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		webFail("Failed to commit weekly row", w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message":"Weekly value saved"}`)
+}
+
+// ---------- POST /services/saveWeeklyEdit ----------
+// Strict StatID-based bulk upsert for personal weekly stats.
+// Payload: JSON array of { StatID:int, Weekending:"YYYY-MM-DD", Value:"string" }
+func handleSaveWeeklyEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		webFail("Failed to read request body", w, err)
+		return
+	}
+
+	var payload []struct {
+		StatID    int    `json:"StatID"`
+		Weekending string `json:"Weekending"`
+		Value     string `json:"Value"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		webFail("Failed to unmarshal payload", w, err)
+		return
+	}
+	if len(payload) == 0 {
+		webFail("Empty payload", w, fmt.Errorf("no rows provided"))
+		return
+	}
+
+	// Validate all weekending dates first
+	for _, row := range payload {
+		if err := checkIfValidWE(row.Weekending); err != nil {
+			webFail(fmt.Sprintf("W/E date %s invalid", row.Weekending), w, err)
+			return
+		}
+	}
+
+	tx, err := DB.Begin()
+	if err != nil {
+		webFail("Failed to start transaction", w, err)
+		return
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	sessionUserID := r.Context().Value("user_id").(int)
+
+	// Collect unique weekendings from payload to remove existing personal rows for those weeks
+	weSet := make(map[string]struct{})
+	for _, row := range payload {
+		weSet[row.Weekending] = struct{}{}
+	}
+	weList := make([]interface{}, 0, len(weSet))
+	for we := range weSet {
+		weList = append(weList, we)
+	}
+	placeholders := strings.Repeat("?,", len(weList))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	// Clear existing personal rows for these week endings
+	if _, err := tx.Exec(fmt.Sprintf("DELETE FROM weekly_stats WHERE user_id = ? AND week_ending IN (%s)", placeholders), append([]interface{}{sessionUserID}, weList...)...); err != nil {
+		tx.Rollback()
+		webFail("Failed to clear personal weekly_stats", w, err)
+		return
+	}
+
+	// Insert each payload row (only personal stats allowed)
+	for _, row := range payload {
+		// Resolve stat metadata by id
+		var shortID, valueType, statType string
+		if err := DB.QueryRow(`SELECT short_id, value_type, type FROM stats WHERE id = ? LIMIT 1`, row.StatID).Scan(&shortID, &valueType, &statType); err != nil {
+			tx.Rollback()
+			if err == sql.ErrNoRows {
+				webFail(fmt.Sprintf("Stat not found for StatID %d", row.StatID), w, err)
+				return
+			}
+			webFail("Failed to query stat metadata", w, err)
+			return
+		}
+		if statType != "personal" {
+			tx.Rollback()
+			webFail(fmt.Sprintf("Stat %s (id=%d) is not personal and cannot be written via this endpoint", shortID, row.StatID), w, fmt.Errorf("invalid stat scope"))
+			return
+		}
+
+		// validate value
+		if err := validateWeeklyValueByType(row.Value, valueType); err != nil {
+			tx.Rollback()
+			webFail(fmt.Sprintf("Invalid value for stat %s: %v", shortID, err), w, err)
+			return
+		}
+
+		// convert to stored integer
+		var storeVal int64
+		switch valueType {
+		case "currency":
+			if strings.TrimSpace(row.Value) == "" {
+				continue
+			}
+			m, err := StringToMoney(row.Value)
+			if err != nil {
+				tx.Rollback()
+				webFail("Invalid currency", w, err)
+				return
+			}
+			storeVal = int64(m.MoneyToUSD())
+		case "number":
+			if strings.TrimSpace(row.Value) == "" {
+				continue
+			}
+			i, err := strconv.Atoi(row.Value)
+			if err != nil {
+				tx.Rollback()
+				webFail("Invalid integer", w, err)
+				return
+			}
+			storeVal = int64(i)
+		case "percentage":
+			if strings.TrimSpace(row.Value) == "" {
+				continue
+			}
+			f, err := strconv.ParseFloat(row.Value, 64)
+			if err != nil {
+				tx.Rollback()
+				webFail("Invalid percentage", w, err)
+				return
+			}
+			storeVal = int64((f * 100) + 0.5)
+		default:
+			tx.Rollback()
+			webFail("Unknown value type", w, fmt.Errorf("value_type=%s", valueType))
+			return
+		}
+
+		// Insert user-scoped weekly row
+		if _, err := tx.Exec(`INSERT INTO weekly_stats (name, week_ending, value, user_id) VALUES (?, ?, ?, ?)`, strings.ToLower(shortID), row.Weekending, storeVal, sessionUserID); err != nil {
+			tx.Rollback()
+			webFail("Failed to insert weekly row", w, err)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		webFail("Failed to commit weekly edits", w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message":"Saved Weekly stat data"}`)
+}
+
+// ---------- GET /services/getWeeklyStats (DB-backed), supports stat_id ----------
+// func handleGetWeeklyStats(w http.ResponseWriter, r *http.Request) {
+// 	q := r.URL.Query()
+// 	statIDStr := q.Get("stat_id")
+// 	statShort := q.Get("stat")
+// 	if statIDStr == "" && statShort == "" {
+// 		webFail("stat_id or stat query param required", w, errors.New("missing stat"))
+// 		return
+// 	}
+
+// 	// Resolve
+// 	nameLower, statType, err := resolveStatIdentity(statIDStr, statShort)
+// 	if err != nil {
+// 		webFail("Failed to resolve stat", w, err)
+// 		return
+// 	}
+
+// 	sessionUserID := r.Context().Value("user_id").(int)
+
+// 	var rows *sql.Rows
+// 	if statType == "personal" {
+// 		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND user_id = ? ORDER BY week_ending`, nameLower, sessionUserID)
+// 	} else {
+// 		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND division_id IS NOT NULL ORDER BY week_ending`, nameLower)
+// 	}
+// 	if err != nil {
+// 		webFail("Failed to query weekly_stats", w, err)
+// 		return
+// 	}
+// 	defer rows.Close()
+
+// 	type WeeklyValue struct {
+// 		WeekEnding string  `json:"Weekending"`
+// 		Value      float64 `json:"Value"`
+// 	}
+// 	out := []WeeklyValue{}
+// 	for rows.Next() {
+// 		var we string
+// 		var v int
+// 		if err := rows.Scan(&we, &v); err != nil {
+// 			webFail("Failed to scan weekly_stats", w, err)
+// 			return
+// 		}
+// 		out = append(out, WeeklyValue{WeekEnding: we, Value: float64(v) / 100.0})
+// 	}
+// 	w.Header().Set("Content-Type", "application/json")
+// 	json.NewEncoder(w).Encode(out)
+// }
+
+// GET /services/getWeeklyStats - now supports optional user_id (admin-only) to fetch another user's personal series.
+func handleGetWeeklyStats(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	statIDStr := q.Get("stat_id")
+	statShort := q.Get("stat")
+	userIDParam := q.Get("user_id") // optional numeric user id when admin is viewing other users
+	if statIDStr == "" && statShort == "" {
+		webFail("stat_id or stat query param required", w, errors.New("missing stat"))
+		return
+	}
+
+	// Resolve stat identity and metadata
+	nameLower, statType, err := resolveStatIdentity(statIDStr, statShort)
+	if err != nil {
+		webFail("Failed to resolve stat", w, err)
+		return
+	}
+
+	// session user id & role
+	sessionUser := r.Context().Value("user_id").(int)
+	sessionIsAdmin := false
+	if role, ok := r.Context().Value("role").(string); ok {
+		sessionIsAdmin = role == "admin"
+	}
+
+	// determine which user_id to use for personal stats
+	targetUserID := sessionUser
+	if userIDParam != "" {
+		// only allow if session user is admin
+		if !sessionIsAdmin {
+			webFail("Insufficient permissions to request other user's stats", w, errors.New("forbidden"))
+			return
+		}
+		if uid, convErr := strconv.Atoi(userIDParam); convErr == nil {
+			targetUserID = uid
+		} else {
+			webFail("Invalid user_id parameter", w, convErr)
+			return
+		}
+	}
+
+	var rows *sql.Rows
+	if statType == "personal" {
+		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND user_id = ? ORDER BY week_ending`, nameLower, targetUserID)
+	} else {
+		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND division_id IS NOT NULL ORDER BY week_ending`, nameLower)
+	}
+	if err != nil {
+		webFail("Failed to query weekly_stats", w, err)
+		return
+	}
+	defer rows.Close()
+
+	type WeeklyValue struct {
+		WeekEnding string  `json:"Weekending"`
+		Value      float64 `json:"Value"`
+	}
+	out := []WeeklyValue{}
+	for rows.Next() {
+		var we string
+		var v int
+		if err := rows.Scan(&we, &v); err != nil {
+			webFail("Failed to scan weekly_stats", w, err)
+			return
+		}
+		// Convert stored integer to formatted number. For currency we assume DB stores cents; handle formatting elsewhere if needed.
+		out = append(out, WeeklyValue{WeekEnding: we, Value: float64(v) / 100.0})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// validateDailyStatByType validates the daily row fields according to value_type.
+// valueType must be "currency", "number", or "percentage".
+func validateDailyStatByType(name, valueType string, row DailyStat) error {
+    // helper to build messages
+    fieldErr := func(field, val, msg string) error {
+        return fmt.Errorf("Value %v on %s for stat %s is invalid: %s", val, field, msg)
+    }
+
+    switch valueType {
+    case "currency":
+        // parse each day and quota with StringToMoney
+        days := map[string]string{
+            "Thursday":  row.Thursday,
+            "Friday":    row.Friday,
+            "Monday":    row.Monday,
+            "Tuesday":   row.Tuesday,
+            "Wednesday": row.Wednesday,
+            "Quota":     row.Quota,
+        }
+        for field, val := range days {
+            if val == "" {
+                // allow empty values (means not entered)
+                continue
+            }
+            if _, err := StringToMoney(val); err != nil {
+                return fieldErr(field, val, "not a valid money value (use plain decimal e.g. 1234.56)")
+            }
+        }
+        return nil
+
+    case "number":
+        days := map[string]string{
+            "Thursday":  row.Thursday,
+            "Friday":    row.Friday,
+            "Monday":    row.Monday,
+            "Tuesday":   row.Tuesday,
+            "Wednesday": row.Wednesday,
+            "Quota":     row.Quota,
+        }
+        for field, val := range days {
+            if val == "" {
+                continue
+            }
+            if _, err := strconv.Atoi(val); err != nil {
+                return fieldErr(field, val, "not a valid integer")
+            }
+        }
+        return nil
+
+    case "percentage":
+        days := map[string]string{
+            "Thursday":  row.Thursday,
+            "Friday":    row.Friday,
+            "Monday":    row.Monday,
+            "Tuesday":   row.Tuesday,
+            "Wednesday": row.Wednesday,
+            "Quota":     row.Quota,
+        }
+        for field, val := range days {
+            if val == "" {
+                continue
+            }
+            f, err := strconv.ParseFloat(val, 64)
+            if err != nil {
+                return fieldErr(field, val, "not a valid number")
+            }
+            // optional: enforce 0 <= f <= 100
+            if f < 0 || f > 100 {
+                return fieldErr(field, val, "percentage out of range 0-100")
+            }
+        }
+        return nil
+
+    default:
+        return fmt.Errorf("Unknown value_type %s for stat %s", valueType, name)
+    }
+}
+
+// validateWeeklyValueByType validates a single value string according to the stat's value_type.
+func validateWeeklyValueByType(valueStr, valueType string) error {
+	valueStr = strings.TrimSpace(valueStr)
+	if valueStr == "" {
+		return nil // empty allowed (means no value)
+	}
+	switch valueType {
+	case "currency":
+		if _, err := StringToMoney(valueStr); err != nil {
+			return fmt.Errorf("invalid currency value: %v", err)
+		}
+		return nil
+	case "number":
+		if _, err := strconv.Atoi(valueStr); err != nil {
+			return fmt.Errorf("invalid integer value: %v", err)
+		}
+		return nil
+	case "percentage":
+		if _, err := strconv.ParseFloat(valueStr, 64); err != nil {
+			return fmt.Errorf("invalid percentage value: %v", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown value_type: %s", valueType)
+	}
+}

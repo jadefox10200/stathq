@@ -6,11 +6,8 @@ import Login from "./components/Login";
 import Register from "./components/Register";
 import ManageUsers from "./components/ManageUsers";
 import ChangePassword from "./components/ChangePassword";
-import InputDailyStats from "./components/InputDailyStats";
-import InputWeeklyStats from "./components/InputWeeklyStats";
-import ViewDailyStats from "./components/ViewDailyStats";
-import ViewWeeklyStats from "./components/ViewWeeklyStats";
-import EditStatsView from "./components/EditStatsView";
+import InputStats from "./components/InputStats";
+import ViewStats from "./components/ViewStats";
 import ManageStats from "./components/ManageStats";
 import AlertModal from "./components/AlertModal";
 
@@ -78,47 +75,20 @@ export default function App() {
           }
         />
         <Route
-          path="/inputDailyStats"
+          path="/inputStats"
           element={
             <ProtectedRoute>
               <Header />
-              <InputDailyStats />
+              <InputStats />
             </ProtectedRoute>
           }
         />
         <Route
-          path="/inputWeeklyStats"
+          path="/viewStats"
           element={
             <ProtectedRoute>
               <Header />
-              <InputWeeklyStats />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/viewDailyStats"
-          element={
-            <ProtectedRoute>
-              <Header />
-              <ViewDailyStats />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/viewWeeklyStats"
-          element={
-            <ProtectedRoute>
-              <Header />
-              <ViewWeeklyStats />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/editStatsView"
-          element={
-            <ProtectedRoute>
-              <Header />
-              <EditStatsView />
+              <ViewStats />
             </ProtectedRoute>
           }
         />
