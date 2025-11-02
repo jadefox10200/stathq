@@ -1,26 +1,21 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gocarina/gocsv"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
@@ -37,10 +32,6 @@ var (
 func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) {
 	if err != nil {
 		log.Printf("%s | data: %v | error: %v", msg, data, err)
-		fmt.Printf("%s | data: %v | error: %v\n", msg, data, err)
-	} else {
-		log.Printf("%s | data: %v", msg, data)
-		fmt.Printf("%s | data: %v\n", msg, data)
 	}
 	type errResp struct {
 		Message string `json:"message"`
@@ -50,13 +41,13 @@ func webFail(msg string, w http.ResponseWriter, err error, data ...interface{}) 
 	if err != nil {
 		resp.Details = err.Error()
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
 	json.NewEncoder(w).Encode(resp)
 }
 
-// AuthMiddleware checks authentication and optionally role
+// Updated AuthMiddleware: put username and role into request context so handlers
+// (e.g., handleGetWeeklyStats) can check role without extra DB lookups.
 func AuthMiddleware(requireRole string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		session, err := store.Get(r, "session-name")
@@ -91,6 +82,8 @@ func AuthMiddleware(requireRole string, next http.Handler) http.Handler {
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, "company_id", companyID)
 		ctx = context.WithValue(ctx, "user_id", userID)
+		ctx = context.WithValue(ctx, "username", username)
+		ctx = context.WithValue(ctx, "role", role) // <-- added so handlers can check role from context
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -135,110 +128,77 @@ func ListAssignedStatsHandler(w http.ResponseWriter, r *http.Request) {
 	uid := r.Context().Value("user_id").(int)
 
 	rows, err := DB.Query(`
-        SELECT 
-            s.id, 
-            s.short_id, 
-            s.full_name, 
-            s.type, 
-            s.value_type, 
-            s.reversed,
-            COALESCE(GROUP_CONCAT(DISTINCT sua.user_id), '') AS user_ids,
-            COALESCE(GROUP_CONCAT(DISTINCT sda.division_id), '') AS division_ids
-        FROM stats s
-        LEFT JOIN stat_user_assignments sua ON s.id = sua.stat_id
-        LEFT JOIN stat_division_assignments sda ON s.id = sda.stat_id
-        WHERE s.id IN (
-            SELECT stat_id FROM stat_user_assignments WHERE user_id = ?
-        )
-        GROUP BY s.id
-    `, uid)
+		SELECT 
+			s.id,
+			s.short_id,
+			s.full_name,
+			s.type,
+			s.value_type,
+			s.reversed,
+			s.assigned_user_id,
+			u.username,
+			s.assigned_division_id,
+			d.name AS division_name
+		FROM stats s
+		LEFT JOIN users u ON s.assigned_user_id = u.id
+		LEFT JOIN divisions d ON s.assigned_division_id = d.id
+		WHERE s.assigned_user_id = ? OR s.id IN (SELECT stat_id FROM stat_user_assignments WHERE user_id = ?)
+		ORDER BY s.short_id
+	`, uid, uid)
 	if err != nil {
 		webFail("Failed to query assigned stats", w, err)
 		return
 	}
 	defer rows.Close()
 
-	type stat struct {
-		ID          int    `json:"id"`
-		ShortID     string `json:"short_id"`
-		FullName    string `json:"full_name"`
-		Type        string `json:"type"`
-		ValueType   string `json:"value_type"`
-		Reversed    bool   `json:"reversed"`
-		UserIDs     []int  `json:"user_ids"`
-		DivisionIDs []int  `json:"division_ids"`
+	type statOut struct {
+		ID               int     `json:"id"`
+		ShortID          string  `json:"short_id"`
+		FullName         string  `json:"full_name"`
+		Type             string  `json:"type"`
+		ValueType        string  `json:"value_type"`
+		Reversed         bool    `json:"reversed"`
+		AssignedUserID   *int    `json:"user_id,omitempty"`
+		AssignedUsername *string `json:"username,omitempty"`
+		AssignedDivision *int    `json:"division_id,omitempty"`
+		AssignedDivName  *string `json:"division_name,omitempty"`
 	}
-
-	var stats []stat
-
+	out := []statOut{}
 	for rows.Next() {
-		var s stat
-		var uids, dids string
-		if err := rows.Scan(
-			&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
-			&uids, &dids,
-		); err != nil {
+		var s statOut
+		var assignedUID sqlNullInt64
+		var assignedUsername sqlNullString
+		var assignedDiv sqlNullInt64
+		var divName sqlNullString
+		if err := rows.Scan(&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
+			&assignedUID, &assignedUsername, &assignedDiv, &divName); err != nil {
 			webFail("Failed to scan assigned stat row", w, err)
 			return
 		}
-		s.UserIDs = splitInt(uids)
-		s.DivisionIDs = splitInt(dids)
-		stats = append(stats, s)
+		if assignedUID.Valid {
+			v := int(assignedUID.Int64)
+			s.AssignedUserID = &v
+		}
+		if assignedUsername.Valid {
+			u := assignedUsername.String
+			s.AssignedUsername = &u
+		}
+		if assignedDiv.Valid {
+			v := int(assignedDiv.Int64)
+			s.AssignedDivision = &v
+		}
+		if divName.Valid {
+			dn := divName.String
+			s.AssignedDivName = &dn
+		}
+		out = append(out, s)
 	}
-
-	if err = rows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		webFail("Error iterating assigned stats", w, err)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
-}
-
-// ---------- SERVICES: DB-backed daily/weekly handlers ----------
-
-// Helper to parse int safely (for weekly/daily numeric fields)
-func parseIntLenient(s string) (int, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, nil
-	}
-	i, err := strconv.Atoi(s)
-	return i, err
-}
-
-
-// GET /services/getDailyStats?date=<we>&stat=<name>
-// DB-backed version: returns JSON with Thursday/Friday/Monday/Tuesday/Wednesday/Quota like old CSV-based handler
-// ---------- Helper: resolve stat type and short id by stat_id or short_id ----------
-func resolveStatIdentity(statIDStr, statShort string) (resolvedShort string, resolvedType string, err error) {
-	// prefer stat_id if provided
-	if statIDStr != "" {
-		id, convErr := strconv.Atoi(statIDStr)
-		if convErr != nil {
-			return "", "", convErr
-		}
-		var shortID string
-		var stype string
-		q := `SELECT short_id, type FROM stats WHERE id = ? LIMIT 1`
-		if scanErr := DB.QueryRow(q, id).Scan(&shortID, &stype); scanErr != nil {
-			return "", "", scanErr
-		}
-		return strings.ToLower(shortID), stype, nil
-	}
-
-	// fallback to short id
-	if statShort != "" {
-		var stype string
-		q := `SELECT type FROM stats WHERE LOWER(short_id) = ? LIMIT 1`
-		if scanErr := DB.QueryRow(q, strings.ToLower(statShort)).Scan(&stype); scanErr != nil {
-			// not found -> default to personal (safe)
-			return strings.ToLower(statShort), "personal", nil
-		}
-		return strings.ToLower(statShort), stype, nil
-	}
-
-	return "", "", errors.New("either stat_id or stat (short id) must be provided")
+	json.NewEncoder(w).Encode(out)
 }
 
 // ---------- GET /services/getDailyStats (DB-backed, scoped by personal vs division), supports stat_id ----------
@@ -261,33 +221,21 @@ func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve stat identity and metadata (prefer stat_id)
-	var nameLower, statType, valueType string
-	if statIDStr != "" {
-		id, err := strconv.Atoi(statIDStr)
-		if err != nil {
-			webFail("Invalid stat_id", w, err)
-			return
-		}
-		if err := DB.QueryRow(`SELECT short_id, type, value_type FROM stats WHERE id = ? LIMIT 1`, id).Scan(&nameLower, &statType, &valueType); err != nil {
-			if err == sql.ErrNoRows {
-				webFail("Stat not found", w, err)
-				return
-			}
-			webFail("Failed to query stat", w, err)
-			return
-		}
-		nameLower = strings.ToLower(nameLower)
-	} else {
-		// fallback to short id resolution (still support for legacy callers)
-		if err := DB.QueryRow(`SELECT short_id, type, value_type FROM stats WHERE LOWER(short_id) = ? LIMIT 1`, strings.ToLower(statShort)).Scan(&nameLower, &statType, &valueType); err != nil {
-			// If not found, treat as personal and default to string values
-			nameLower = strings.ToLower(statShort)
-			statType = "personal"
-			valueType = "number"
-		} else {
-			nameLower = strings.ToLower(nameLower)
-		}
+	var userName, nameLower, statType, valueType string
+	id, err := strconv.Atoi(statIDStr)
+	if err != nil {
+		webFail("Invalid stat_id", w, err)
+		return
 	}
+	if err := DB.QueryRow(`SELECT s.short_id, s.type, u.username, s.value_type FROM stats s LEFT JOIN users u on s.assigned_user_id = u.id WHERE s.id = ? LIMIT 1`, id).Scan(&nameLower, &statType, &userName, &valueType); err != nil {
+		if err == sql.ErrNoRows {
+			webFail("Stat not found", w, err)
+			return
+		}
+		webFail("Failed to query stat", w, err)
+		return
+	}
+	nameLower = strings.ToLower(nameLower)
 
 	// compute concrete dates (Thursday = thisWeek)
 	we, _ := time.Parse("2006-01-02", thisWeek)
@@ -305,19 +253,11 @@ func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
 		Quota: "",
 	}
 
-	// session user id (for personal scope)
-	sessionUserID := r.Context().Value("user_id").(int)
-
 	for day, dateStr := range dates {
 		// Query the stored integer value (assumed stored as integer; for currency it's cents)
 		var v sql.NullInt64
 		var err error
-		if statType == "personal" {
-			err = DB.QueryRow(`SELECT value FROM daily_stats WHERE LOWER(name)=? AND date=? AND user_id=? LIMIT 1`, nameLower, dateStr, sessionUserID).Scan(&v)
-		} else {
-			// divisional/main: look for division-level row (as before)
-			err = DB.QueryRow(`SELECT value FROM daily_stats WHERE LOWER(name)=? AND date=? AND division_id IS NOT NULL LIMIT 1`, nameLower, dateStr).Scan(&v)
-		}
+		err = DB.QueryRow(`SELECT value FROM daily_stats WHERE stat_id=? AND date=? LIMIT 1`, statIDStr, dateStr).Scan(&v)
 		if err != nil && err != sql.ErrNoRows {
 			webFail("Failed to query daily_stats", w, err)
 			return
@@ -504,8 +444,6 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 		"Wednesday": we.AddDate(0, 0, 6).Format("2006-01-02"),
 	}
 
-	sessionUserID := r.Context().Value("user_id").(int)
-
 	for _, row := range rows {
 		// Resolve stat by ID (no fallback)
 		var shortID string
@@ -520,7 +458,6 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 			webFail("Failed to look up stat by StatID", w, err)
 			return
 		}
-		nameLower := strings.ToLower(shortID)
 
 		// Only support personal writes via this endpoint (safer). Reject divisional/main writes here.
 		if statType != "personal" {
@@ -530,7 +467,7 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Delete existing rows for this user and stat name for the week
-		if _, err := tx.Exec(`DELETE FROM daily_stats WHERE LOWER(name)=? AND date IN (?,?,?,?,?) AND user_id = ?`, nameLower, dates["Thursday"], dates["Friday"], dates["Monday"], dates["Tuesday"], dates["Wednesday"], sessionUserID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM daily_stats WHERE stat_id=? AND date IN (?,?,?,?,?)`, row.StatID, dates["Thursday"], dates["Friday"], dates["Monday"], dates["Tuesday"], dates["Wednesday"]); err != nil {
 			tx.Rollback()
 			webFail("Failed to clear existing personal daily rows", w, err)
 			return
@@ -561,7 +498,7 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			dateStr := dates[day]
-			if _, err := tx.Exec(`INSERT INTO daily_stats (name, date, value, user_id) VALUES (?, ?, ?, ?)`, nameLower, dateStr, valueInt, sessionUserID); err != nil {
+			if _, err := tx.Exec(`INSERT INTO daily_stats (stat_id, date, value) VALUES (?, ?, ?)`, row.StatID, dateStr, valueInt); err != nil {
 				tx.Rollback()
 				webFail("Failed to insert personal daily row", w, err)
 				return
@@ -578,8 +515,6 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"message":"Saved 7R grid"}`)
 }
 
-// The rest of main() remains unchanged except for wiring the new handlers
-//
 func main() {
 	f := CreateLog()
 	defer f.Close()
@@ -622,6 +557,8 @@ func main() {
 	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
 	// NEW: assigned stats endpoint for non-admin users
 	router.Handle("/api/stats/assigned", AuthMiddleware("", http.HandlerFunc(ListAssignedStatsHandler))).Methods("GET")
+	// Add after your other API routes:
+	router.Handle("/api/stats/{id}/series", AuthMiddleware("", http.HandlerFunc(GetStatSeriesHandler))).Methods("GET")
 
 	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
 	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
@@ -663,180 +600,181 @@ func main() {
 	log.Fatal(http.ListenAndServe(port, nil))
 }
 
-// (other functions in the file remain unchanged; only handlers above were added/modified)
 // ---------- CREATE STAT ----------
 func CreateStatHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
-        return
-    }
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
 
-    // 1. Decode FIRST
-    var req struct {
-        ShortID     string `json:"short_id"`
-        FullName    string `json:"full_name"`
-        Type        string `json:"type"`
-        ValueType   string `json:"value_type"`
-        Reversed    bool   `json:"reversed"`
-        UserIDs     []int  `json:"user_ids"`
-        DivisionIDs []int  `json:"division_ids"`
-    }
+	var req struct {
+		ShortID     string `json:"short_id"`
+		FullName    string `json:"full_name"`
+		Type        string `json:"type"`
+		ValueType   string `json:"value_type"`
+		Reversed    bool   `json:"reversed"`
+		UserIDs     []int  `json:"user_ids"`     // compatibility: we accept array but use the first element
+		DivisionIDs []int  `json:"division_ids"` // compatibility: accept array, use first
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		webFail("Invalid JSON payload", w, err)
+		return
+	}
 
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        webFail("Invalid JSON payload", w, err)
-        return
-    }
+	// Validation
+	if strings.TrimSpace(req.ShortID) == "" {
+		webFail("Short ID is required", w, nil)
+		return
+	}
+	if strings.TrimSpace(req.FullName) == "" {
+		webFail("Full Name is required", w, nil)
+		return
+	}
+	req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
+	req.FullName = strings.TrimSpace(req.FullName)
 
-    // 2. Validate AFTER decode
-    if strings.TrimSpace(req.ShortID) == "" {
-        webFail("Short ID is required", w, nil)
-        return
-    }
-    if strings.TrimSpace(req.FullName) == "" {
-        webFail("Full Name is required", w, nil)
-        return
-    }
+	tx, err := DB.Begin()
+	if err != nil {
+		webFail("Failed to start transaction", w, err)
+		return
+	}
 
-    // Optional: sanitize
-    req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
-    req.FullName = strings.TrimSpace(req.FullName)
+	res, err := tx.Exec(`
+		INSERT INTO stats (short_id, full_name, type, value_type, reversed, assigned_user_id, assigned_division_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed,
+		nullIntPtr(req.UserIDs),
+		nullIntPtr(req.DivisionIDs),
+	)
+	if err != nil {
+		tx.Rollback()
+		webFail("Failed to insert stat", w, err)
+		return
+	}
+	statID, err := res.LastInsertId()
+	if err != nil {
+		tx.Rollback()
+		webFail("Failed to get last insert id", w, err)
+		return
+	}
 
-    // 3. Start transaction
-    tx, err := DB.Begin()
-    if err != nil {
-        webFail("Failed to start transaction", w, err)
-        return
-    }
+	// Keep compatibility: populate stat_user_assignments / stat_division_assignments
+	for _, uid := range req.UserIDs {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`, statID, uid); err != nil {
+			tx.Rollback()
+			webFail("Failed to populate stat_user_assignments", w, err)
+			return
+		}
+	}
+	for _, did := range req.DivisionIDs {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`, statID, did); err != nil {
+			tx.Rollback()
+			webFail("Failed to populate stat_division_assignments", w, err)
+			return
+		}
+	}
 
-    // 4. Insert stat
-    res, err := tx.Exec(`
-        INSERT INTO stats (short_id, full_name, type, value_type, reversed) 
-        VALUES (?, ?, ?, ?, ?)`,
-        req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed,
-    )
-    if err != nil {
-        tx.Rollback()
-        webFail("Failed to insert stat", w, err)
-        return
-    }
+	if err := tx.Commit(); err != nil {
+		webFail("Failed to commit", w, err)
+		return
+	}
 
-    statID, _ := res.LastInsertId()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Stat created"})
+}
 
-    // 5. Assign users
-    for _, uid := range req.UserIDs {
-        if _, err := tx.Exec(
-            `INSERT INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`,
-            statID, uid,
-        ); err != nil {
-            tx.Rollback()
-            webFail("Failed to assign user", w, err, "user_id", uid)
-            return
-        }
-    }
-
-    // 6. Assign divisions
-    for _, did := range req.DivisionIDs {
-        if _, err := tx.Exec(
-            `INSERT INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`,
-            statID, did,
-        ); err != nil {
-            tx.Rollback()
-            webFail("Failed to assign division", w, err, "division_id", did)
-            return
-        }
-    }
-
-    // 7. Commit
-    if err := tx.Commit(); err != nil {
-        webFail("Failed to commit transaction", w, err)
-        return
-    }
-
-    // 8. Success
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusCreated)
-    json.NewEncoder(w).Encode(map[string]string{"message": "Stat created"})
+// Helper: return first element pointer or nil
+func nullIntPtr(arr []int) interface{} {
+	if len(arr) > 0 {
+		return arr[0]
+	}
+	return nil
 }
 
 // ---------- UPDATE STAT ----------
 func UpdateStatHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPatch {
-        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
-        return
-    }
+	if r.Method != http.MethodPatch {
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
 
-    idStr := mux.Vars(r)["id"]
-    id, err := strconv.Atoi(idStr)
-    if err != nil {
-        webFail("Invalid stat ID", w, err)
-        return
-    }
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		webFail("Invalid stat ID", w, err)
+		return
+	}
 
-    var req struct {
-        ShortID     string `json:"short_id"`
-        FullName    string `json:"full_name"`
-        Type        string `json:"type"`
-        ValueType   string `json:"value_type"`
-        Reversed    bool   `json:"reversed"`
-        UserIDs     []int  `json:"user_ids"`
-        DivisionIDs []int  `json:"division_ids"`
-    }
+	var req struct {
+		ShortID     string `json:"short_id"`
+		FullName    string `json:"full_name"`
+		Type        string `json:"type"`
+		ValueType   string `json:"value_type"`
+		Reversed    bool   `json:"reversed"`
+		UserIDs     []int  `json:"user_ids"`
+		DivisionIDs []int  `json:"division_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		webFail("Invalid JSON payload", w, err)
+		return
+	}
 
-    // DECODE FIRST
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        webFail("Invalid JSON payload", w, err)
-        return
-    }
+	if strings.TrimSpace(req.ShortID) == "" || strings.TrimSpace(req.FullName) == "" {
+		webFail("Short ID and Full Name are required", w, nil)
+		return
+	}
+	req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
+	req.FullName = strings.TrimSpace(req.FullName)
 
-    // VALIDATE
-    if strings.TrimSpace(req.ShortID) == "" {
-        webFail("Short ID is required", w, nil)
-        return
-    }
-    if strings.TrimSpace(req.FullName) == "" {
-        webFail("Full Name is required", w, nil)
-        return
-    }
+	tx, err := DB.Begin()
+	if err != nil {
+		webFail("Failed to start transaction", w, err)
+		return
+	}
 
-    req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
-    req.FullName = strings.TrimSpace(req.FullName)
+	_, err = tx.Exec(`UPDATE stats SET short_id=?, full_name=?, type=?, value_type=?, reversed=?, assigned_user_id=?, assigned_division_id=? WHERE id = ?`,
+		req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed,
+		nullIntPtr(req.UserIDs), nullIntPtr(req.DivisionIDs), id)
+	if err != nil {
+		tx.Rollback()
+		webFail("Failed to update stat", w, err)
+		return
+	}
 
-    tx, err := DB.Begin()
-    if err != nil {
-        webFail("Failed to start transaction", w, err)
-        return
-    }
+	// Rebuild assignment tables for compatibility
+	if _, err := tx.Exec(`DELETE FROM stat_user_assignments WHERE stat_id = ?`, id); err != nil {
+		tx.Rollback()
+		webFail("Failed to clear stat_user_assignments", w, err)
+		return
+	}
+	for _, uid := range req.UserIDs {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`, id, uid); err != nil {
+			tx.Rollback()
+			webFail("Failed to insert stat_user_assignment", w, err)
+			return
+		}
+	}
 
-    // Update stat
-    _, err = tx.Exec(`
-        UPDATE stats 
-        SET short_id = ?, full_name = ?, type = ?, value_type = ?, reversed = ?
-        WHERE id = ?`,
-        req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed, id,
-    )
-    if err != nil {
-        tx.Rollback()
-        webFail("Failed to update stat", w, err, "id", id)
-        return
-    }
+	if _, err := tx.Exec(`DELETE FROM stat_division_assignments WHERE stat_id = ?`, id); err != nil {
+		tx.Rollback()
+		webFail("Failed to clear stat_division_assignments", w, err)
+		return
+	}
+	for _, did := range req.DivisionIDs {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`, id, did); err != nil {
+			tx.Rollback()
+			webFail("Failed to insert stat_division_assignment", w, err)
+			return
+		}
+	}
 
-    // Clear + reassign
-    tx.Exec(`DELETE FROM stat_user_assignments WHERE stat_id = ?`, id)
-    tx.Exec(`DELETE FROM stat_division_assignments WHERE stat_id = ?`, id)
+	if err := tx.Commit(); err != nil {
+		webFail("Failed to commit update", w, err)
+		return
+	}
 
-    for _, uid := range req.UserIDs {
-        tx.Exec(`INSERT INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`, id, uid)
-    }
-    for _, did := range req.DivisionIDs {
-        tx.Exec(`INSERT INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`, id, did)
-    }
-
-    if err := tx.Commit(); err != nil {
-        webFail("Failed to commit", w, err)
-        return
-    }
-
-    json.NewEncoder(w).Encode(map[string]string{"message": "Stat updated"})
+	json.NewEncoder(w).Encode(map[string]string{"message": "Stat updated"})
 }
 
 // ---------- DELETE STAT ----------
@@ -861,68 +799,77 @@ func DeleteStatHandler(w http.ResponseWriter, r *http.Request) {
 
 // ---------- LIST ALL STATS (with assignments) ----------
 func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
-    rows, err := DB.Query(`
-        SELECT 
-            s.id, 
-            s.short_id, 
-            s.full_name, 
-            s.type, 
-            s.value_type, 
-            s.reversed,
+	rows, err := DB.Query(`
+		SELECT 
+			s.id,
+			s.short_id,
+			s.full_name,
+			s.type,
+			s.value_type,
+			s.reversed,
+			s.assigned_user_id,
 			u.username,
-			d.name as div_name,
-            COALESCE(GROUP_CONCAT(DISTINCT sua.user_id), '') AS user_ids,
-            COALESCE(GROUP_CONCAT(DISTINCT sda.division_id), '') AS division_ids
-        FROM stats s
-        LEFT JOIN stat_user_assignments sua ON s.id = sua.stat_id
-		LEFT JOIN users u ON sua.user_id = u.id
-        LEFT JOIN stat_division_assignments sda ON s.id = sda.stat_id
-		LEFT JOIN divisions d ON sda.division_id = d.id
-        GROUP BY s.id
-    `)
-    if err != nil {
-        webFail("Failed to query stats", w, err)
-        return
-    }
-    defer rows.Close()
+			s.assigned_division_id,
+			d.name AS division_name
+		FROM stats s
+		LEFT JOIN users u ON s.assigned_user_id = u.id
+		LEFT JOIN divisions d ON s.assigned_division_id = d.id
+		ORDER BY u.username, s.type
+	`)
+	if err != nil {
+		webFail("Failed to query stats", w, err)
+		return
+	}
+	defer rows.Close()
 
-    type stat struct {
-        ID          int    `json:"id"`
-        ShortID     string `json:"short_id"`
-        FullName    string `json:"full_name"`
-        Type        string `json:"type"`
-        ValueType   string `json:"value_type"`
-        Reversed    bool   `json:"reversed"`
-		UserName    string  `json:"username"`
-		DivName    string   `json:"div_name"`
-        UserIDs     []int  `json:"user_ids"`
-        DivisionIDs []int  `json:"division_ids"`
-    }
-
-    var stats []stat
-
-    for rows.Next() {
-        var s stat
-        var uids, dids string // will be "" if no assignments
-        if err := rows.Scan(
-            &s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,&s.UserName,&s.DivName,
-            &uids, &dids,
-        ); err != nil {
-            webFail("Failed to scan stat row", w, err)
-            return
-        }
-        s.UserIDs = splitInt(uids)
-        s.DivisionIDs = splitInt(dids)
-        stats = append(stats, s)
-    }
-
-    if err = rows.Err(); err != nil {
-        webFail("Error iterating stats", w, err)
-        return
-    }
-
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(stats) // [] if no stats
+	type statOut struct {
+		ID                int     `json:"id"`
+		ShortID           string  `json:"short_id"`
+		FullName          string  `json:"full_name"`
+		Type              string  `json:"type"`
+		ValueType         string  `json:"value_type"`
+		Reversed          bool    `json:"reversed"`
+		AssignedUserID    *int    `json:"user_id,omitempty"`
+		AssignedUsername  *string `json:"username,omitempty"`
+		AssignedDivision  *int    `json:"division_id,omitempty"`
+		AssignedDivName   *string `json:"division_name,omitempty"`
+	}
+	out := []statOut{}
+	for rows.Next() {
+		var s statOut
+		var assignedUID sqlNullInt64
+		var assignedUsername sqlNullString
+		var assignedDiv sqlNullInt64
+		var divName sqlNullString
+		if err := rows.Scan(&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
+			&assignedUID, &assignedUsername, &assignedDiv, &divName); err != nil {
+			webFail("Failed to scan stat row", w, err)
+			return
+		}
+		if assignedUID.Valid {
+			v := int(assignedUID.Int64)
+			s.AssignedUserID = &v
+		}
+		if assignedUsername.Valid {
+			u := assignedUsername.String
+			s.AssignedUsername = &u
+		}
+		if assignedDiv.Valid {
+			v := int(assignedDiv.Int64)
+			s.AssignedDivision = &v
+		}
+		if divName.Valid {
+			dn := divName.String
+			s.AssignedDivName = &dn
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		webFail("Error iterating stats", w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 func splitInt(s string) []int {
@@ -1302,87 +1249,6 @@ func UserHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"message": "User created successfully"}`)
 }
 
-
-// func main() {
-// 	f := CreateLog()
-// 	defer f.Close()
-
-// 	InitDB()
-
-// 	store = sessions.NewCookieStore([]byte("super-secret-key"))
-// 	store.Options = &sessions.Options{
-// 		Path:     "/",
-// 		MaxAge:   3600 * 8,
-// 		HttpOnly: true,
-// 		Secure:   false,
-// 	}
-
-// 	router := mux.NewRouter()
-
-// 	corsMiddleware := handlers.CORS(
-// 		handlers.AllowedOrigins([]string{"http://localhost:3000"}),
-// 		handlers.AllowedMethods([]string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}),
-// 		handlers.AllowedHeaders([]string{"Content-Type"}),
-// 		handlers.AllowCredentials(),
-// 	)
-
-// 	// services endpoints
-// 	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleWeeklyStatsRequest)))
-// 	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleDailyStatsRequest)))
-// 	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
-// 	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
-// 	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
-
-// 	// Admin-only endpoints
-// 	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
-// 	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
-// 	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
-// 	router.Handle("/api/users/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteUserHandler)))
-// 	router.Handle("/api/users/{id}/role", AuthMiddleware("admin", http.HandlerFunc(UpdateUserRoleHandler)))
-// 	router.Handle("/api/stats", AuthMiddleware("admin", http.HandlerFunc(CreateStatHandler))).Methods("POST")
-// 	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(UpdateStatHandler))).Methods("PATCH")
-// 	router.Handle("/api/stats/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteStatHandler))).Methods("DELETE")
-// 	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
-// 	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
-// 	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
-// 	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
-
-// 	// User info endpoint
-// 	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
-
-// 	// Change password endpoint (for any authenticated user)
-// 	router.Handle("/api/change-password", AuthMiddleware("", http.HandlerFunc(ChangePasswordHandler)))
-	
-// 	// Auth endpoints (unprotected)
-// 	router.HandleFunc("/login", LoginHandler)
-// 	router.HandleFunc("/logout", LogoutHandler)
-// 	router.HandleFunc("/register", RegisterHandler)
-
-// 	// Static file handlers
-// 	cssHandler := http.FileServer(http.Dir("public/css"))
-// 	router.PathPrefix("/public/css/").Handler(http.StripPrefix("/public/css", addHeaders(cssHandler, "text/css", "public/css")))
-
-// 	jsHandler := http.FileServer(http.Dir("public/js"))
-// 	router.PathPrefix("/public/js/").Handler(http.StripPrefix("/public/js", addHeaders(jsHandler, "application/javascript", "public/js")))
-
-// 	semanticHandler := http.FileServer(http.Dir("public/Semantic-UI-2.3.0/dist"))
-// 	router.PathPrefix("/public/Semantic-UI-2.3.0/dist/").Handler(http.StripPrefix("/public/Semantic-UI-2.3.0/dist", addHeaders(semanticHandler, "", "public/Semantic-UI-2.3.0/dist")))
-
-// 	videoHandler := http.FileServer(http.Dir("public/AV"))
-// 	router.PathPrefix("/public/AV/").Handler(http.StripPrefix("/public/AV", addHeaders(videoHandler, "video/mp4", "public/AV")))
-
-// 	publicHandler := http.FileServer(http.Dir("public"))
-// 	router.PathPrefix("/public/").Handler(http.StripPrefix("/public", addHeaders(publicHandler, "", "public")))
-
-// 	router.PathPrefix("/").HandlerFunc(handleIndex)
-
-// 	http.Handle("/", corsMiddleware(router))
-
-// 	port := ":9090"
-// 	fmt.Printf("Running Stat HQ on %s\n", port)
-// 	log.Fatal(http.ListenAndServe(port, nil))
-// }
-
 // ---------- LIST ALL DIVISIONS ----------
 func ListDivisionsHandler(w http.ResponseWriter, r *http.Request) {
     rows, err := DB.Query(`SELECT id, name FROM divisions ORDER BY name`)
@@ -1537,79 +1403,6 @@ type Json7R struct {
 	Stats    []DailyStat `json:"Stats"`
 }
 
-func validateDailyStats(v DailyStat) error {
-
-	switch v.Name {
-	case "GI", "VSD":
-		_, err := StringToMoney(v.Thursday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Thursday for stat %s is invalid. Please check your data and try again", v.Thursday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = StringToMoney(v.Friday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Friday for stat %s is invalid. Please check your data and try again", v.Friday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = StringToMoney(v.Monday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Monday for stat %s is invalid. Please check your data and try again", v.Monday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = StringToMoney(v.Tuesday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Tuesday for stat %s is invalid. Please check your data and try again", v.Tuesday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = StringToMoney(v.Wednesday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Wednesday for stat %s is invalid. Please check your data and try again", v.Wednesday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = StringToMoney(v.Quota)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v for the %s Quota is invalid. Please check your data and try again", v.Quota, v.Name)
-			return errors.New(msg)
-		}
-	case "Sites":
-		_, err := strconv.Atoi(v.Thursday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Thursday for stat %s is invalid. Please check your data and try again", v.Thursday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = strconv.Atoi(v.Friday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Friday for stat %s is invalid. Please check your data and try again", v.Friday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = strconv.Atoi(v.Monday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Monday for stat %s is invalid. Please check your data and try again", v.Monday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = strconv.Atoi(v.Tuesday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Tuesday for stat %s is invalid. Please check your data and try again", v.Tuesday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = strconv.Atoi(v.Wednesday)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v on Wednesday for stat %s is invalid. Please check your data and try again", v.Wednesday, v.Name)
-			return errors.New(msg)
-		}
-		_, err = strconv.Atoi(v.Quota)
-		if err != nil {
-			msg := fmt.Sprintf("Value %v for the %s Quota is invalid. Please check your data and try again", v.Quota, v.Name)
-			return errors.New(msg)
-		}
-	default:
-		msg := fmt.Sprintf("The stat name %v is not valid. It should be GI, VSD or Sites\n", v.Name)
-		return errors.New(msg)
-	}
-
-	return nil
-}
-
 type Daily7RStatFloat struct {
 	ThisWeek float64
 	LastWeek float64
@@ -1624,458 +1417,6 @@ type Daily7RStatInt struct {
 	Cum      int
 	Quota    int
 	Day      string
-}
-
-func handleDailyStatsRequest(w http.ResponseWriter, r *http.Request) {
-
-	q := r.URL.Query()
-	thisWeek := q.Get("date")
-	statName := q.Get("stat")
-
-	err := checkIfValidWE(thisWeek)
-	if err != nil {
-		msg := fmt.Sprintf("Invalid W/E date")
-		webFail(msg, w, err)
-		return
-	}
-
-	//get this weeks 7r and parse the csv into a struct...
-	fileName := fmt.Sprintf("public/dailyStats/%s.csv", thisWeek)
-	file, err := os.Open(fileName)
-	if errors.Is(err, os.ErrNotExist) {
-		// handle the case where the file doesn't exist
-		_, err = copyFile("public/dailyStats/template.csv", fileName)
-		if err != nil {
-			msg := "failed to create copy of the template.csv file"
-			webFail(msg, w, err)
-			return
-		}
-		file, err = os.Open(fileName)
-		if err != nil {
-			msg := fmt.Sprintf("Couldn't open %s", fileName)
-			webFail(msg, w, err)
-			return
-		}
-	} else if err != nil {
-		msg := fmt.Sprintf("couldn't open the file: %s", fileName)
-		webFail(msg, w, err)
-		return
-	}
-
-	statGrid := make([]DailyStat, 0)
-	err = gocsv.UnmarshalFile(file, &statGrid)
-	if err != nil {
-		msg := "Failed to unmarshal csv file"
-		webFail(msg, w, err)
-		return
-	}
-	var thisWkStat = DailyStat{}
-	for _, v := range statGrid {
-		if strings.ToUpper(v.Name) == strings.ToUpper(statName) {
-			thisWkStat = v
-			break
-		}
-	}
-
-	if thisWkStat.Name == "" {
-		msg := fmt.Sprintf("Didn't find match for %s", statName)
-		webFail("", w, errors.New(msg))
-		return
-	}
-	//get last weeks stat
-	t, _ := time.Parse("2006-01-02", thisWeek)
-	t.Add(time.Hour * -24 * 7)
-	lastWeek := t.Format("2006-01-02")
-
-	fileNameLastWk := fmt.Sprintf("public/dailyStats/%s.csv", lastWeek)
-	fileLastWk, err := os.Open(fileNameLastWk)
-	if errors.Is(err, os.ErrNotExist) {
-		// handle the case where the file doesn't exist
-		_, err = copyFile("public/dailyStats/template.csv", fileNameLastWk)
-		if err != nil {
-			msg := "failed to create copy of the template.csv file"
-			webFail(msg, w, err)
-			return
-		}
-		fileLastWk, err = os.Open(fileNameLastWk)
-		if err != nil {
-			msg := fmt.Sprintf("Couldn't open %s", fileNameLastWk)
-			webFail(msg, w, err)
-			return
-		}
-	} else if err != nil {
-		msg := fmt.Sprintf("couldn't open the file: %s", fileNameLastWk)
-		webFail(msg, w, err)
-		return
-	}
-
-	statGridLastWk := make([]DailyStat, 0)
-	err = gocsv.UnmarshalFile(fileLastWk, &statGridLastWk)
-	if err != nil {
-		msg := "Failed to unmarshal csv file"
-		webFail(msg, w, err)
-		return
-	}
-	var lastWkStat = DailyStat{}
-	for _, v := range statGridLastWk {
-		if v.Name == statName {
-			lastWkStat = v
-			break
-		}
-	}
-
-	//compile stuff:
-
-	if statName == "gi" || statName == "vsd" {
-		thursCum, err := CumWeekFloat(thisWkStat.Thursday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		friCum, err := CumWeekFloat(thisWkStat.Thursday, thisWkStat.Friday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		monCum, err := CumWeekFloat(thisWkStat.Thursday, thisWkStat.Friday, thisWkStat.Monday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		tuesCum, err := CumWeekFloat(thisWkStat.Thursday, thisWkStat.Friday, thisWkStat.Monday, thisWkStat.Tuesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		wedCum, err := CumWeekFloat(thisWkStat.Thursday, thisWkStat.Friday, thisWkStat.Monday, thisWkStat.Tuesday, thisWkStat.Wednesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastThursCum, err := CumWeekFloat(lastWkStat.Thursday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastFriCum, err := CumWeekFloat(lastWkStat.Thursday, lastWkStat.Friday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastMonCum, err := CumWeekFloat(lastWkStat.Thursday, lastWkStat.Friday, lastWkStat.Monday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastTuesCum, err := CumWeekFloat(lastWkStat.Thursday, lastWkStat.Friday, lastWkStat.Monday, lastWkStat.Tuesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastWedCum, err := CumWeekFloat(lastWkStat.Thursday, lastWkStat.Friday, lastWkStat.Monday, lastWkStat.Tuesday, lastWkStat.Wednesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		thursQuota, err := GetQuotaFloat(1, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		friQuota, err := GetQuotaFloat(2, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		monQuota, err := GetQuotaFloat(3, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		tuesQuota, err := GetQuotaFloat(4, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		wedQuota, err := GetQuotaFloat(5, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-
-		if thisWkStat.Thursday == "" {
-			thisWkStat.Thursday = "0.00"
-		}
-		thisThursDaily, err := strconv.ParseFloat(thisWkStat.Thursday, 64)
-		if err != nil {
-			webFail("thursday 7r fail", w, err)
-			return
-		}
-
-		week7R := make([]Daily7RStatFloat, 0)
-		thurs := Daily7RStatFloat{
-			ThisWeek: thisThursDaily,
-			LastWeek: lastThursCum,
-			Cum:      thursCum,
-			Quota:    thursQuota,
-			Day:      "Thursday",
-		}
-		week7R = append(week7R, thurs)
-
-		if thisWkStat.Friday == "" {
-			thisWkStat.Friday = "0.00"
-		}
-		thisFriDaily, err := strconv.ParseFloat(thisWkStat.Friday, 64)
-		if err != nil {
-			webFail("friday 7r fail", w, err)
-			return
-		}
-
-		fri := Daily7RStatFloat{
-			ThisWeek: thisFriDaily,
-			LastWeek: lastFriCum,
-			Cum:      friCum,
-			Quota:    friQuota,
-			Day:      "Friday",
-		}
-		week7R = append(week7R, fri)
-
-		if thisWkStat.Monday == "" {
-			thisWkStat.Monday = "0.00"
-		}
-		thisMonDaily, err := strconv.ParseFloat(thisWkStat.Monday, 64)
-		if err != nil {
-			webFail("monday 7r fail", w, err)
-			return
-		}
-
-		mon := Daily7RStatFloat{
-			ThisWeek: thisMonDaily,
-			LastWeek: lastMonCum,
-			Cum:      monCum,
-			Quota:    monQuota,
-			Day:      "Monday",
-		}
-		week7R = append(week7R, mon)
-
-		if thisWkStat.Tuesday == "" {
-			thisWkStat.Tuesday = "0.00"
-		}
-		thisTuesDaily, err := strconv.ParseFloat(thisWkStat.Tuesday, 64)
-		if err != nil {
-			webFail("tuesday 7r fail", w, err)
-			return
-		}
-		tues := Daily7RStatFloat{
-			ThisWeek: thisTuesDaily,
-			LastWeek: lastTuesCum,
-			Cum:      tuesCum,
-			Quota:    tuesQuota,
-			Day:      "Tuesday",
-		}
-		week7R = append(week7R, tues)
-
-		if thisWkStat.Wednesday == "" {
-			thisWkStat.Wednesday = "0.00"
-		}
-		thisWedDaily, err := strconv.ParseFloat(thisWkStat.Wednesday, 64)
-		if err != nil {
-			webFail("wednesday 7r fail", w, err)
-			return
-		}
-		wed := Daily7RStatFloat{
-			ThisWeek: thisWedDaily,
-			LastWeek: lastWedCum,
-			Cum:      wedCum,
-			Quota:    wedQuota,
-			Day:      "Wednesday",
-		}
-		week7R = append(week7R, wed)
-
-		err = json.NewEncoder(w).Encode(week7R)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to encode for 7R")
-			webFail(msg, w, err)
-			return
-		}
-
-	} else if statName == "sites" {
-		thursCum, err := CumWeekInt(thisWkStat.Thursday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		friCum, err := CumWeekInt(thisWkStat.Thursday, thisWkStat.Friday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		monCum, err := CumWeekInt(thisWkStat.Thursday, thisWkStat.Friday, thisWkStat.Monday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		tuesCum, err := CumWeekInt(thisWkStat.Thursday, thisWkStat.Friday, thisWkStat.Monday, thisWkStat.Tuesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		wedCum, err := CumWeekInt(thisWkStat.Thursday, thisWkStat.Friday, thisWkStat.Monday, thisWkStat.Tuesday, thisWkStat.Wednesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastThursCum, err := CumWeekInt(lastWkStat.Thursday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastFriCum, err := CumWeekInt(lastWkStat.Thursday, lastWkStat.Friday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastMonCum, err := CumWeekInt(lastWkStat.Thursday, lastWkStat.Friday, lastWkStat.Monday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastTuesCum, err := CumWeekInt(lastWkStat.Thursday, lastWkStat.Friday, lastWkStat.Monday, lastWkStat.Tuesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		lastWedCum, err := CumWeekInt(lastWkStat.Thursday, lastWkStat.Friday, lastWkStat.Monday, lastWkStat.Tuesday, lastWkStat.Wednesday)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		thursQuota, err := GetQuotaInt(1, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		friQuota, err := GetQuotaInt(2, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		monQuota, err := GetQuotaInt(3, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		tuesQuota, err := GetQuotaInt(4, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-		wedQuota, err := GetQuotaInt(5, thisWkStat.Quota)
-		if err != nil {
-			webFail("", w, err)
-			return
-		}
-
-		if thisWkStat.Thursday == "" {
-			thisWkStat.Thursday = "0.00"
-		}
-		thisThursDaily, err := strconv.Atoi(thisWkStat.Thursday)
-		if err != nil {
-			webFail("thursday 7r fail", w, err)
-			return
-		}
-		week7R := make([]Daily7RStatInt, 0)
-		thurs := Daily7RStatInt{
-			ThisWeek: thisThursDaily,
-			LastWeek: lastThursCum,
-			Cum:      thursCum,
-			Quota:    thursQuota,
-			Day:      "Thursday",
-		}
-		week7R = append(week7R, thurs)
-
-		if thisWkStat.Friday == "" {
-			thisWkStat.Friday = "0.00"
-		}
-		thisFriDaily, err := strconv.Atoi(thisWkStat.Friday)
-		if err != nil {
-			webFail("friday 7r fail", w, err)
-			return
-		}
-		fri := Daily7RStatInt{
-			ThisWeek: thisFriDaily,
-			LastWeek: lastFriCum,
-			Cum:      friCum,
-			Quota:    friQuota,
-			Day:      "Friday",
-		}
-		week7R = append(week7R, fri)
-
-		if thisWkStat.Monday == "" {
-			thisWkStat.Monday = "0.00"
-		}
-		thisMonDaily, err := strconv.Atoi(thisWkStat.Monday)
-		if err != nil {
-			webFail("monday 7r fail", w, err)
-			return
-		}
-		mon := Daily7RStatInt{
-			ThisWeek: thisMonDaily,
-			LastWeek: lastMonCum,
-			Cum:      monCum,
-			Quota:    monQuota,
-			Day:      "Monday",
-		}
-		week7R = append(week7R, mon)
-
-		if thisWkStat.Tuesday == "" {
-			thisWkStat.Tuesday = "0.00"
-		}
-		thisTuesDaily, err := strconv.Atoi(thisWkStat.Tuesday)
-		if err != nil {
-			webFail("tuesday 7r fail", w, err)
-			return
-		}
-		tues := Daily7RStatInt{
-			ThisWeek: thisTuesDaily,
-			LastWeek: lastTuesCum,
-			Cum:      tuesCum,
-			Quota:    tuesQuota,
-			Day:      "Tuesday",
-		}
-		week7R = append(week7R, tues)
-
-		if thisWkStat.Wednesday == "" {
-			thisWkStat.Wednesday = "0.00"
-		}
-		thisWedDaily, err := strconv.Atoi(thisWkStat.Wednesday)
-		if err != nil {
-			webFail("wednesday 7r fail", w, err)
-			return
-		}
-		wed := Daily7RStatInt{
-			ThisWeek: thisWedDaily,
-			LastWeek: lastWedCum,
-			Cum:      wedCum,
-			Quota:    wedQuota,
-			Day:      "Wednesday",
-		}
-		week7R = append(week7R, wed)
-
-		err = json.NewEncoder(w).Encode(week7R)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to encode for 7R")
-			webFail(msg, w, err)
-			return
-		}
-
-	} else {
-		msg := fmt.Sprintf("Didn't find stat name: %s.", statName)
-		webFail(msg, w, errors.New(msg))
-		return
-	}
-
-	return
 }
 
 func GetQuotaInt(i int, q string) (int, error) {
@@ -2135,82 +1476,6 @@ func CumWeekFloat(args ...string) (float64, error) {
 	return d.Float64(), nil
 }
 
-// func handleSave7R(w http.ResponseWriter, r *http.Request) {
-
-// 	statGrid := make([]DailyStat, 3)
-
-// 	err := json.NewDecoder(r.Body).Decode(&statGrid)
-// 	if err != nil {
-// 		msg := "Failed to decode body"
-// 		webFail(msg, w, err)
-// 		return
-// 	}
-
-// 	fmt.Println(statGrid)
-
-// 	for _, v := range statGrid {
-// 		err = validateDailyStats(v)
-// 		if err != nil {
-// 			webFail("", w, err)
-// 			return
-// 		}
-// 	}
-
-// 	q := r.URL.Query()
-// 	thisWeek := q.Get("thisWeek")
-
-// 	err = checkIfValidWE(thisWeek)
-// 	if err != nil {
-// 		msg := "The weekending date is not valid or is not Thursday"
-// 		webFail(msg, w, err)
-// 		return
-// 	}
-
-// 	fileName := fmt.Sprintf("public/dailyStats/%s.csv", thisWeek)
-
-// 	err = os.Remove(fileName)
-// 	if err != nil {
-// 		msg := "Failed to delete a file which makes it impossible to save"
-// 		webFail(msg, w, err)
-// 		return
-// 	}
-
-// 	file, err := os.Create(fileName)
-// 	if err != nil {
-// 		msg := fmt.Sprintf("Failed to create file %s", fileName)
-// 		webFail(msg, w, err)
-// 		return
-// 	}
-
-// 	err = gocsv.MarshalFile(statGrid, file)
-// 	if err != nil {
-// 		msg := "Failed to marshal the file"
-// 		webFail(msg, w, err)
-// 		return
-// 	}
-
-// 	msg := "Saved 7R grid"
-// 	io.WriteString(w, msg)
-
-// 	return
-// }
-
-// func addHeaders(fs http.Handler) http.HandlerFunc {
-// 	return func(w http.ResponseWriter, r *http.Request) {
-// 		w.Header().Set("Content-Type", "application/javascript")
-// 		// w.Header().Add("X-Frame-Options", "DENY")
-// 		fs.ServeHTTP(w, r)
-// 	}
-// }
-
-// func handleIndex(w http.ResponseWriter, req *http.Request) {
-
-// 	http.Redirect(w, req, "/tpl/home", 302)
-// 	return
-// 	// renderTemplate(w, req, "home", nil)
-
-// }
-
 type IntWeeklyStatValue struct {
 	WeekEnding string
 	Value      int
@@ -2230,216 +1495,6 @@ type SingleWeeklyStat struct {
 	Sites      int     `csv:"sites" json:"Sites"`
 	Outstanding	int     `csv:"outstanding" json:"Outstanding"`
 	Profit     float64 `csv:"-"`
-}
-
-func handleWeeklyStatsRequest(w http.ResponseWriter, r *http.Request) {
-
-	q := r.URL.Query()
-	statName := q.Get("stat")
-
-	statSlice := make([]SingleWeeklyStat, 0)
-
-	f, err := os.Open("public/stats/weekly.csv")
-	if err != nil {
-		webFail("Failed to open weekly.csv", w, err)
-		return
-	}
-	defer f.Close()
-
-	err = gocsv.UnmarshalFile(f, &statSlice)
-	if err != nil {
-		webFail("Failed to unmarshal file weekly.csv", w, err)
-		return
-	}
-
-	//sort the array just in case they were entered out of order
-	sort.Slice(statSlice, func(i, j int) bool {
-		return statSlice[i].WeekEnding < statSlice[j].WeekEnding
-	})
-
-	//build profit:
-	for k, v := range statSlice {
-		gUSD := ToUSD(v.GI)
-		eUSD := ToUSD(v.Expenses)
-		pUSD := gUSD - eUSD
-		statSlice[k].Profit = pUSD.Float64()
-	}
-
-	err = json.NewEncoder(w).Encode(statSlice)
-	if err != nil {
-		msg := fmt.Sprintf("Failed to encode for stat %s", statName)
-		webFail(msg, w, err)
-		return
-	}
-
-	return
-}
-
-func getWeeklyStatData(statName string) (interface{}, error) {
-
-	switch statName {
-	case "gi", "vsd", "expenses", "outstanding":
-		fileName := fmt.Sprintf("public/stats/%s.csv", statName)
-
-		f, err := os.Open(fileName)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to open file %s. %v\n", fileName, err.Error())
-			return nil, errors.New(msg)
-		}
-		statValues := make([]FloatWeeklyStatValue, 0)
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := scanner.Text()
-			lineSep := strings.Split(line, ",")
-			if len(lineSep) != 2 {
-				msg := fmt.Sprintf("Couldn't split line: %v. %s\n", line, err.Error())
-				return nil, errors.New(msg)
-			}
-			m, err := StringToMoney(lineSep[1])
-			if err != nil {
-				msg := fmt.Sprintf("Couldn't convert money %v. %s\n", lineSep[1], err.Error())
-				return nil, errors.New(msg)
-			}
-			i := m.MoneyToUSD().Float64()
-			stat := FloatWeeklyStatValue{
-				WeekEnding: lineSep[0],
-				Value:      i,
-			}
-			statValues = append(statValues, stat)
-		}
-
-		sort.Slice(statValues, func(i, j int) bool {
-			return statValues[i].WeekEnding < statValues[j].WeekEnding
-		})
-
-		return statValues, nil
-
-	case "sites", "scheduled":
-		fileName := fmt.Sprintf("public/stats/%s.csv", statName)
-
-		f, err := os.Open(fileName)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to open file %s. %s\n", fileName, err.Error())
-			return nil, errors.New(msg)
-		}
-		statValues := make([]IntWeeklyStatValue, 0)
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := scanner.Text()
-			lineSep := strings.Split(line, ",")
-			if len(lineSep) != 2 {
-				msg := fmt.Sprintf("Couldn't split line: %v. %s\n", line, err.Error())
-				return nil, errors.New(msg)
-			}
-			i, err := strconv.Atoi(lineSep[1])
-			if err != nil {
-				msg := fmt.Sprintf("Couldn't convert string to number. The source data is bad: %v. %s\n", lineSep[1], err.Error())
-				return nil, errors.New(msg)
-			}
-			stat := IntWeeklyStatValue{
-				WeekEnding: lineSep[0],
-				Value:      i,
-			}
-			statValues = append(statValues, stat)
-		}
-
-		sort.Slice(statValues, func(i, j int) bool {
-			return statValues[i].WeekEnding < statValues[j].WeekEnding
-		})
-
-		return statValues, nil
-
-	case "profit":
-		expenseFileName := fmt.Sprintf("public/stats/expenses.csv")
-		ef, err := os.Open(expenseFileName)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to open file %s. %s\n", expenseFileName, err.Error())
-			return nil, errors.New(msg)
-		}
-		giFileName := fmt.Sprintf("public/stats/gi.csv")
-		gf, err := os.Open(giFileName)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to open file %s. %s\n", giFileName, err.Error())
-			return nil, errors.New(msg)
-		}
-
-		eValues := make([]FloatWeeklyStatValue, 0)
-		eScanner := bufio.NewScanner(ef)
-		for eScanner.Scan() {
-			line := eScanner.Text()
-			lineSep := strings.Split(line, ",")
-			if len(lineSep) != 2 {
-				msg := fmt.Sprintf("Couldn't split line: %v. %s\n", line, err.Error())
-				return nil, errors.New(msg)
-			}
-			m, err := StringToMoney(lineSep[1])
-			if err != nil {
-				msg := fmt.Sprintf("Couldn't convert money %v. %s\n", lineSep[1], err.Error())
-				return nil, errors.New(msg)
-			}
-			i := m.MoneyToUSD().Float64()
-			stat := FloatWeeklyStatValue{
-				WeekEnding: lineSep[0],
-				Value:      i,
-			}
-			eValues = append(eValues, stat)
-		}
-
-		sort.Slice(eValues, func(i, j int) bool {
-			return eValues[i].WeekEnding < eValues[j].WeekEnding
-		})
-
-		gValues := make([]FloatWeeklyStatValue, 0)
-		gScanner := bufio.NewScanner(gf)
-		for gScanner.Scan() {
-			line := gScanner.Text()
-			lineSep := strings.Split(line, ",")
-			if len(lineSep) != 2 {
-				msg := fmt.Sprintf("Couldn't split line: %v. %s\n", line, err.Error())
-				return nil, errors.New(msg)
-			}
-			m, err := StringToMoney(lineSep[1])
-			if err != nil {
-				msg := fmt.Sprintf("Couldn't convert money %v. %s\n", lineSep[1], err.Error())
-				return nil, errors.New(msg)
-			}
-			i := m.MoneyToUSD().Float64()
-			stat := FloatWeeklyStatValue{
-				WeekEnding: lineSep[0],
-				Value:      i,
-			}
-			gValues = append(gValues, stat)
-		}
-
-		sort.Slice(gValues, func(i, j int) bool {
-			return gValues[i].WeekEnding < gValues[j].WeekEnding
-		})
-		profitValues := make([]FloatWeeklyStatValue, 0)
-		for k, v := range eValues {
-			if v.WeekEnding != gValues[k].WeekEnding {
-				msg := fmt.Sprintf("Weekendings don't match between the expense weeks and the gi weeks: %s, %s\n", v.WeekEnding, gValues[k].WeekEnding)
-				return nil, errors.New(msg)
-			}
-
-			//float64 gi to USD
-			gUSD := ToUSD(gValues[k].Value)
-			eUSD := ToUSD(v.Value)
-			pUSD := gUSD - eUSD
-			pFloat := pUSD.Float64()
-			pValue := FloatWeeklyStatValue{
-				WeekEnding: v.WeekEnding,
-				Value:      pFloat,
-			}
-			profitValues = append(profitValues, pValue)
-		}
-
-		return profitValues, nil
-
-	default:
-		msg := fmt.Sprintf("Stat %s not found\n", statName)
-		return nil, errors.New(msg)
-	}
-
 }
 
 // Checks that the weekending date passed in is the correct format and that it is a Thursday. It returns nil upon success.
@@ -2537,89 +1592,6 @@ func (m *Money) MoneyToUSD() USD {
 	return USD(c)
 }
 
-
-// change this so it is simply a generic template loader:
-func handleTemplates(w http.ResponseWriter, r *http.Request) {
-
-	name := strings.TrimPrefix(r.URL.Path, "/tpl/")
-
-	if name == "inputWeeklyStats" {
-		RenderInputWeekly(w, r, name)
-		return
-	}
-
-	if name == "inputDailyStats" {
-		RenderInputDaily(w, r, name)
-		return
-	}
-
-	if name == "editStatsView" {
-		RenderEditWeekly(w, r, name)
-		return
-	}
-
-	if name == "viewDailyStats" {
-		RenderViewDaily(w, r, name)
-		return
-	}
-
-	renderTemplate(w, r, name, nil)
-
-	return
-}
-
-func RenderViewDaily(w http.ResponseWriter, r *http.Request, name string) {
-
-	weeks := getWeeks(16)
-
-	data := struct {
-		Weeks []string
-	}{weeks}
-
-	renderTemplate(w, r, name, data)
-
-	return
-}
-
-func RenderEditWeekly(w http.ResponseWriter, r *http.Request, name string) {
-
-	f, err := os.Open("public/stats/weekly.csv")
-	if err != nil {
-		webFail("Couldn't open weekly.csv", w, err)
-		return
-	}
-
-	//create single data cluster
-	statSlice := make([]SingleWeeklyStat, 0)
-
-	//unmarshal the file:
-	err = gocsv.UnmarshalFile(f, &statSlice)
-	if err != nil {
-		webFail("Failed to unmarshal weekly.csv", w, err)
-		return
-	}
-
-	sort.Slice(statSlice, func(i, j int) bool {
-		return statSlice[i].WeekEnding < statSlice[j].WeekEnding
-	})
-
-	//build profit:
-	for k, v := range statSlice {
-		gUSD := ToUSD(v.GI)
-		eUSD := ToUSD(v.Expenses)
-		pUSD := gUSD - eUSD
-		statSlice[k].Profit = pUSD.Float64()
-	}
-
-	data := struct {
-		Stats []SingleWeeklyStat
-	}{statSlice}
-
-	renderTemplate(w, r, name, data)
-
-	return
-}
-
 func getWeeks(n int) []string {
 	now.WeekStartDay = time.Friday
 	var week = now.EndOfWeek()
@@ -2674,151 +1646,6 @@ type DailyStat struct {
 	Quota     string `csv:"Quotas" json:"Quota"`
 }
 
-func RenderInputDaily(w http.ResponseWriter, r *http.Request, name string) {
-
-	weeks := getWeeks(16)
-
-	r.ParseForm()
-	_, hasMyParam := r.Form["thisWeek"]
-	thisWeek := ""
-	index := "0"
-	if hasMyParam {
-		q := r.URL.Query()
-		thisWeek = q.Get("thisWeek")
-		//we assume that if we got thisWeek we should also have index...
-		index = q.Get("index")
-	}
-
-	if thisWeek == "" {
-		thisWeek = weeks[0]
-	}
-
-	err := checkIfValidWE(thisWeek)
-	if err != nil {
-		msg := fmt.Sprintf("WE is not a weekending: %s", thisWeek)
-		webFail(msg, w, err)
-		return
-	}
-
-	fileName := fmt.Sprintf("public/dailyStats/%s.csv", thisWeek)
-	file, err := os.Open(fileName)
-	if errors.Is(err, os.ErrNotExist) {
-		// handle the case where the file doesn't exist
-		_, err = copyFile("public/dailyStats/template.csv", fileName)
-		if err != nil {
-			msg := "failed to create copy of the template.csv file"
-			webFail(msg, w, err)
-			return
-		}
-		file, err = os.Open(fileName)
-		if err != nil {
-			msg := fmt.Sprintf("Couldn't open %s", fileName)
-			webFail(msg, w, err)
-			return
-		}
-	} else if err != nil {
-		msg := fmt.Sprintf("couldn't open the file: %s", fileName)
-		webFail(msg, w, err)
-		return
-	}
-
-	statGrid := make([]DailyStat, 0)
-	err = gocsv.UnmarshalFile(file, &statGrid)
-	if err != nil {
-		msg := "Failed to unmarshal csv file"
-		webFail(msg, w, err)
-		return
-	}
-
-	parsedDate, _ := time.Parse("2006-01-02", thisWeek)
-	thisWeekFormatted := parsedDate.Format("2 Jan 2006")
-
-	data := struct {
-		Weeks       []string
-		ThisWeek    string
-		ThisWeekRaw string
-		Stats       []DailyStat
-		Index       string
-	}{weeks, thisWeekFormatted, thisWeek, statGrid, index}
-
-	renderTemplate(w, r, name, data)
-
-	return
-}
-
-func RenderInputWeekly(w http.ResponseWriter, r *http.Request, name string) {
-
-	weeks := getWeeks(16)
-
-	data := struct {
-		Weeks []string
-	}{weeks}
-
-	renderTemplate(w, r, name, data)
-
-	return
-}
-
-func renderTemplate(w http.ResponseWriter, r *http.Request, name string, data interface{}) {
-	// parse templates
-	tpl := template.New("").Funcs(template.FuncMap{
-		// "abs":            Abs,
-		// "MultPercent":    MultPercent,
-		// "CheckSymbolId":  CheckSymbolId,
-		// "GetTickerPrice": GetTickerPrice,
-		// "Mul":            SimpleMult,
-		// "Sub":            SimpleSub,
-		// "Div":            SimpleDiv,
-		// "RunningTotal":   RunningTotal,
-	})
-	tpl, err := tpl.ParseGlob("templates/*.gohtml")
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	// execute page
-	var bufBody, bufHeader, bufFooter bytes.Buffer
-	err = tpl.ExecuteTemplate(&bufHeader, "header", data)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	err = tpl.ExecuteTemplate(&bufBody, name, data)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	err = tpl.ExecuteTemplate(&bufFooter, "footer", data)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	// execute layout
-	type Model struct {
-		Header template.HTML
-		Body   template.HTML
-		// LoggedIn bool
-		PageName template.HTML
-		Footer   template.HTML
-	}
-	model := Model{
-		PageName: template.HTML(`<link rel="stylesheet" type="text/css" href="/public/css/` + name + `.css">`),
-		Header:   template.HTML(bufHeader.String()),
-		Body:     template.HTML(bufBody.String()),
-		Footer:   template.HTML(bufBody.String()),
-	}
-
-	err = tpl.ExecuteTemplate(w, "index", model)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	return
-
-}
-
 // ... (rest of the code: CreateLog, FileExists, DailyStat, validateDailyStats, StringToMoney, getWeeks, checkIfValidWE, webFail, handleClassifications, handleDivisions, handleStats, handleDailyStatsRequest, handleWeeklyStatsRequest, handleSave7R, handleLogWeeklyStats, handleSaveWeeklyEdit remain unchanged from artifact version 54392640-368e-42c1-b319-d3e4ba07984e)
 // Creates the log.txt which will log activity (mostly used for error logging). This appends all new data to the file.
 func CreateLog() *os.File {
@@ -2836,61 +1663,67 @@ func CreateLog() *os.File {
 }
 
 // ---------- POST /services/logWeeklyStats ----------
-// Minimal StatID-based single write endpoint. Accepts form-encoded or JSON:
-// - form: stat_id=<id>&date=<YYYY-MM-DD>&value=<string>
-// - JSON: { "stat_id": <id>, "date": "YYYY-MM-DD", "value": "<string>" }
 func handleLogWeeklyStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Support JSON or form body
-	var statID int
-	var date string
-	var value string
 	ct := r.Header.Get("Content-Type")
+	var payload struct {
+		StatID int    `json:"stat_id"`
+		Date   string `json:"date"`
+		Value  string `json:"value"`
+		// These are accepted only for intent: if admin wants to reassign the stat permanently,
+		// they should call UpdateStatHandler instead. We'll ignore these for matching.
+		UserID *int `json:"user_id,omitempty"`
+		DivID  *int `json:"division_id,omitempty"`
+	}
 	if strings.HasPrefix(ct, "application/json") {
-		var payload struct {
-			StatID int    `json:"stat_id"`
-			Date   string `json:"date"`
-			Value  string `json:"value"`
-		}
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			webFail("Failed to read request body", w, err)
-			return
-		}
-		if err := json.Unmarshal(body, &payload); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			webFail("Failed to parse JSON", w, err)
 			return
 		}
-		statID = payload.StatID
-		date = payload.Date
-		value = payload.Value
 	} else {
-		// form
 		if err := r.ParseForm(); err != nil {
 			webFail("Failed to parse form", w, err)
 			return
 		}
-		statID, _ = strconv.Atoi(r.FormValue("stat_id"))
-		date = r.FormValue("date")
-		value = r.FormValue("value")
+		payload.StatID, _ = strconv.Atoi(r.FormValue("stat_id"))
+		payload.Date = r.FormValue("date")
+		payload.Value = r.FormValue("value")
+		// parse but do not use for matching
+		if v := r.FormValue("user_id"); v != "" {
+			if id, err := strconv.Atoi(v); err == nil {
+				payload.UserID = &id
+			}
+		}
+		if v := r.FormValue("division_id"); v != "" {
+			if id, err := strconv.Atoi(v); err == nil {
+				payload.DivID = &id
+			}
+		}
 	}
 
-	if statID == 0 {
+	if payload.StatID == 0 {
 		webFail("stat_id is required", w, fmt.Errorf("stat_id required"))
 		return
 	}
-	if err := checkIfValidWE(date); err != nil {
-		webFail("The weekending date is not valid or is not Thursday", w, err)
+	if err := checkIfValidWE(payload.Date); err != nil {
+		webFail("Invalid weekending date", w, err)
 		return
 	}
 
-	// Resolve stat metadata
-	var shortID, valueType, statType string
-	if err := DB.QueryRow(`SELECT short_id, value_type, type FROM stats WHERE id = ? LIMIT 1`, statID).Scan(&shortID, &valueType, &statType); err != nil {
+	// get session user id for audit
+	sessUID := r.Context().Value("user_id")
+	var authorID interface{} = nil
+	if sessUID != nil {
+		authorID = sessUID
+	}
+
+	// Resolve stat type and value_type for validation
+	var statType, valueType string
+	if err := DB.QueryRow(`SELECT type, value_type FROM stats WHERE id = ? LIMIT 1`, payload.StatID).Scan(&statType, &valueType); err != nil {
 		if err == sql.ErrNoRows {
 			webFail("Stat not found", w, err)
 			return
@@ -2898,36 +1731,31 @@ func handleLogWeeklyStats(w http.ResponseWriter, r *http.Request) {
 		webFail("Failed to query stat metadata", w, err)
 		return
 	}
-	if statType != "personal" {
-		webFail("Only personal stats can be written via this endpoint", w, fmt.Errorf("invalid stat scope"))
-		return
-	}
 
-	// validate value according to valueType
-	if err := validateWeeklyValueByType(value, valueType); err != nil {
+	// validate and convert the provided value into storage form
+	if err := validateWeeklyValueByType(payload.Value, valueType); err != nil {
 		webFail("Invalid value", w, err)
 		return
 	}
 
-	// convert to storage integer
 	var storeVal int64
 	switch valueType {
 	case "currency":
-		m, err := StringToMoney(value)
+		m, err := StringToMoney(payload.Value)
 		if err != nil {
 			webFail("Invalid currency", w, err)
 			return
 		}
 		storeVal = int64(m.MoneyToUSD())
 	case "number":
-		i, err := strconv.Atoi(value)
+		i, err := strconv.Atoi(strings.TrimSpace(payload.Value))
 		if err != nil {
 			webFail("Invalid integer", w, err)
 			return
 		}
 		storeVal = int64(i)
 	case "percentage":
-		f, err := strconv.ParseFloat(value, 64)
+		f, err := strconv.ParseFloat(strings.TrimSpace(payload.Value), 64)
 		if err != nil {
 			webFail("Invalid percentage", w, err)
 			return
@@ -2938,26 +1766,44 @@ func handleLogWeeklyStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Insert: remove existing personal row for this stat/date/user then insert
+	// Upsert by stat_id + week_ending (single canonical row)
 	tx, err := DB.Begin()
 	if err != nil {
 		webFail("Failed to start transaction", w, err)
 		return
 	}
-	sessionUserID := r.Context().Value("user_id").(int)
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
-	if _, err := tx.Exec(`DELETE FROM weekly_stats WHERE LOWER(name)=? AND week_ending = ? AND user_id = ?`, strings.ToLower(shortID), date, sessionUserID); err != nil {
+	var existingID int64
+	err = tx.QueryRow(`SELECT id FROM weekly_stats WHERE stat_id = ? AND week_ending = ? LIMIT 1`, payload.StatID, payload.Date).Scan(&existingID)
+	if err != nil && err != sql.ErrNoRows {
 		tx.Rollback()
-		webFail("Failed to clear existing weekly row", w, err)
+		webFail("Failed to query weekly_stats", w, err)
 		return
 	}
-	if _, err := tx.Exec(`INSERT INTO weekly_stats (name, week_ending, value, user_id) VALUES (?, ?, ?, ?)`, strings.ToLower(shortID), date, storeVal, sessionUserID); err != nil {
-		tx.Rollback()
-		webFail("Failed to insert weekly row", w, err)
-		return
+
+	if err == nil {
+		// update existing single canonical row
+		if _, err = tx.Exec(`UPDATE weekly_stats SET value = ?, author_user_id = ? WHERE id = ?`, storeVal, authorID, existingID); err != nil {
+			tx.Rollback()
+			webFail("Failed to update weekly_stats", w, err)
+			return
+		}
+	} else {
+		// insert new canonical row (we do NOT set user_id/division_id here)
+		if _, err = tx.Exec(`INSERT INTO weekly_stats (stat_id, week_ending, value, author_user_id) VALUES (?, ?, ?, ?)`, payload.StatID, payload.Date, storeVal, authorID); err != nil {
+			tx.Rollback()
+			webFail("Failed to insert weekly_stats", w, err)
+			return
+		}
 	}
+
 	if err := tx.Commit(); err != nil {
-		webFail("Failed to commit weekly row", w, err)
+		webFail("Failed to commit weekly_stats", w, err)
 		return
 	}
 
@@ -3119,125 +1965,89 @@ func handleSaveWeeklyEdit(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"message":"Saved Weekly stat data"}`)
 }
 
-// ---------- GET /services/getWeeklyStats (DB-backed), supports stat_id ----------
-// func handleGetWeeklyStats(w http.ResponseWriter, r *http.Request) {
-// 	q := r.URL.Query()
-// 	statIDStr := q.Get("stat_id")
-// 	statShort := q.Get("stat")
-// 	if statIDStr == "" && statShort == "" {
-// 		webFail("stat_id or stat query param required", w, errors.New("missing stat"))
-// 		return
-// 	}
-
-// 	// Resolve
-// 	nameLower, statType, err := resolveStatIdentity(statIDStr, statShort)
-// 	if err != nil {
-// 		webFail("Failed to resolve stat", w, err)
-// 		return
-// 	}
-
-// 	sessionUserID := r.Context().Value("user_id").(int)
-
-// 	var rows *sql.Rows
-// 	if statType == "personal" {
-// 		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND user_id = ? ORDER BY week_ending`, nameLower, sessionUserID)
-// 	} else {
-// 		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND division_id IS NOT NULL ORDER BY week_ending`, nameLower)
-// 	}
-// 	if err != nil {
-// 		webFail("Failed to query weekly_stats", w, err)
-// 		return
-// 	}
-// 	defer rows.Close()
-
-// 	type WeeklyValue struct {
-// 		WeekEnding string  `json:"Weekending"`
-// 		Value      float64 `json:"Value"`
-// 	}
-// 	out := []WeeklyValue{}
-// 	for rows.Next() {
-// 		var we string
-// 		var v int
-// 		if err := rows.Scan(&we, &v); err != nil {
-// 			webFail("Failed to scan weekly_stats", w, err)
-// 			return
-// 		}
-// 		out = append(out, WeeklyValue{WeekEnding: we, Value: float64(v) / 100.0})
-// 	}
-// 	w.Header().Set("Content-Type", "application/json")
-// 	json.NewEncoder(w).Encode(out)
-// }
-
 // GET /services/getWeeklyStats - now supports optional user_id (admin-only) to fetch another user's personal series.
 func handleGetWeeklyStats(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	statIDStr := q.Get("stat_id")
-	statShort := q.Get("stat")
-	userIDParam := q.Get("user_id") // optional numeric user id when admin is viewing other users
-	if statIDStr == "" && statShort == "" {
-		webFail("stat_id or stat query param required", w, errors.New("missing stat"))
+	if statIDStr == "" {
+		webFail("stat_id is required", w, errors.New("missing stat_id"))
 		return
 	}
-
-	// Resolve stat identity and metadata
-	nameLower, statType, err := resolveStatIdentity(statIDStr, statShort)
+	statID, err := strconv.Atoi(statIDStr)
 	if err != nil {
-		webFail("Failed to resolve stat", w, err)
+		webFail("Invalid stat_id", w, err)
 		return
 	}
 
-	// session user id & role
-	sessionUser := r.Context().Value("user_id").(int)
-	sessionIsAdmin := false
-	if role, ok := r.Context().Value("role").(string); ok {
-		sessionIsAdmin = role == "admin"
-	}
-
-	// determine which user_id to use for personal stats
-	targetUserID := sessionUser
-	if userIDParam != "" {
-		// only allow if session user is admin
-		if !sessionIsAdmin {
-			webFail("Insufficient permissions to request other user's stats", w, errors.New("forbidden"))
+	// Resolve stat and value_type
+	var statType, valueType string
+	if err := DB.QueryRow(`SELECT type, value_type FROM stats WHERE id = ? LIMIT 1`, statID).Scan(&statType, &valueType); err != nil {
+		if err == sql.ErrNoRows {
+			webFail("Stat not found", w, err)
 			return
 		}
-		if uid, convErr := strconv.Atoi(userIDParam); convErr == nil {
-			targetUserID = uid
-		} else {
-			webFail("Invalid user_id parameter", w, convErr)
-			return
-		}
+		webFail("Failed to query stat metadata", w, err)
+		return
 	}
 
-	var rows *sql.Rows
-	if statType == "personal" {
-		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND user_id = ? ORDER BY week_ending`, nameLower, targetUserID)
-	} else {
-		rows, err = DB.Query(`SELECT week_ending, value FROM weekly_stats WHERE LOWER(name)=? AND division_id IS NOT NULL ORDER BY week_ending`, nameLower)
+	type WeeklyValue struct {
+		WeekEnding   string `json:"Weekending"`
+		Value        float64 `json:"Value"`
+		AuthorUserID *int   `json:"author_user_id,omitempty"`
 	}
+
+	out := []WeeklyValue{}
+
+	rows, err := DB.Query(`
+		SELECT week_ending, value, author_user_id
+		FROM weekly_stats
+		WHERE stat_id = ?
+		ORDER BY week_ending
+	`, statID)
 	if err != nil {
 		webFail("Failed to query weekly_stats", w, err)
 		return
 	}
 	defer rows.Close()
 
-	type WeeklyValue struct {
-		WeekEnding string  `json:"Weekending"`
-		Value      float64 `json:"Value"`
-	}
-	out := []WeeklyValue{}
 	for rows.Next() {
 		var we string
-		var v int
-		if err := rows.Scan(&we, &v); err != nil {
+		var v int64
+		var author sql.NullInt64
+		if err := rows.Scan(&we, &v, &author); err != nil {
 			webFail("Failed to scan weekly_stats", w, err)
 			return
 		}
-		// Convert stored integer to formatted number. For currency we assume DB stores cents; handle formatting elsewhere if needed.
-		out = append(out, WeeklyValue{WeekEnding: we, Value: float64(v) / 100.0})
+		var val float64
+		switch valueType {
+		case "currency":
+			val = float64(v) / 100.0
+		case "number":
+			val = float64(v)
+		case "percentage":
+			val = float64(v) / 100.0
+		default:
+			val = float64(v) / 100.0
+		}
+		var auth *int
+		if author.Valid {
+			t := int(author.Int64)
+			auth = &t
+		}
+		out = append(out, WeeklyValue{WeekEnding: we, Value: val, AuthorUserID: auth})
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// Note: sqlNullInt64 and sqlNullString helpers to avoid importing database/sql types widely in this file.
+type sqlNullInt64 struct {
+	sql.NullInt64
+}
+
+type sqlNullString struct {
+	sql.NullString
 }
 
 // validateDailyStatByType validates the daily row fields according to value_type.
@@ -3343,4 +2153,111 @@ func validateWeeklyValueByType(valueStr, valueType string) error {
 	default:
 		return fmt.Errorf("unknown value_type: %s", valueType)
 	}
+}
+
+// GetStatSeriesHandler returns time series for a stat.
+// Route: GET /api/stats/{id}/series?view=weekly[&user_id=...]
+// Currently implements only view=weekly and returns JSON:
+// [{ "Weekending":"YYYY-MM-DD", "Value": <number>, "author_user_id": <int|null> }, ...]
+func GetStatSeriesHandler(w http.ResponseWriter, r *http.Request) {
+	// require auth (router will wrap via AuthMiddleware)
+	vars := mux.Vars(r)
+	idStr := vars["id"]
+	if idStr == "" {
+		http.Error(w, `{"message":"stat id required"}`, http.StatusBadRequest)
+		return
+	}
+	statID, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, `{"message":"invalid stat id"}`, http.StatusBadRequest)
+		return
+	}
+
+	// view param (only weekly supported now)
+	view := r.URL.Query().Get("view")
+	if view == "" {
+		view = "weekly"
+	}
+	if view != "weekly" {
+		http.Error(w, `{"message":"only 'weekly' view is implemented"}`, http.StatusNotImplemented)
+		return
+	}
+
+	// (optional) allow admin to pass user_id for future per-user logic (ignored now)
+	userIDParam := r.URL.Query().Get("user_id")
+	if userIDParam != "" {
+		// You can validate admin here if you want to restrict; currently we just accept and ignore.
+		if _, err := strconv.Atoi(userIDParam); err != nil {
+			http.Error(w, `{"message":"invalid user_id"}`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	// get stat value_type for conversion
+	var valueType string
+	if err := DB.QueryRow(`SELECT value_type FROM stats WHERE id = ? LIMIT 1`, statID).Scan(&valueType); err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, `{"message":"stat not found"}`, http.StatusNotFound)
+			return
+		}
+		webFail("Failed to query stat metadata", w, err)
+		return
+	}
+
+	// Query canonical weekly rows for the stat
+	rows, err := DB.Query(`SELECT week_ending, value, author_user_id FROM weekly_stats WHERE stat_id = ? ORDER BY week_ending`, statID)
+	if err != nil {
+		webFail("Failed to query weekly series", w, err)
+		return
+	}
+	defer rows.Close()
+
+	type seriesRow struct {
+		Weekending   string   `json:"Weekending"`
+		Value        float64  `json:"Value"`
+		AuthorUserID *int     `json:"author_user_id,omitempty"`
+	}
+
+	out := make([]seriesRow, 0)
+	for rows.Next() {
+		var we string
+		var v sql.NullInt64
+		var author sql.NullInt64
+		if err := rows.Scan(&we, &v, &author); err != nil {
+			webFail("Failed to scan weekly row", w, err)
+			return
+		}
+		if !v.Valid {
+			// skip null values (shouldn't happen for weekly_stats)
+			continue
+		}
+
+		var value float64
+		switch valueType {
+		case "currency":
+			// stored as cents -> return dollars float
+			value = float64(v.Int64) / 100.0
+		case "number":
+			value = float64(v.Int64)
+		case "percentage":
+			// stored as percent * 100 (e.g., 1234 -> 12.34)
+			value = float64(v.Int64) / 100.0
+		default:
+			value = float64(v.Int64)
+		}
+
+		var au *int
+		if author.Valid {
+			t := int(author.Int64)
+			au = &t
+		}
+		out = append(out, seriesRow{Weekending: we, Value: value, AuthorUserID: au})
+	}
+	if err := rows.Err(); err != nil {
+		webFail("Error iterating series rows", w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }

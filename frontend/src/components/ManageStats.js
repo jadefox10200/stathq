@@ -28,8 +28,10 @@ export default function ManageStats() {
   const [type, setType] = useState("personal");
   const [valueType, setValueType] = useState("number");
   const [reversed, setReversed] = useState(false);
-  const [assignedUsers, setAssignedUsers] = useState([]);
-  const [assignedDivs, setAssignedDivs] = useState([]);
+
+  // NOTE: single assigned user and single assigned division
+  const [assignedUser, setAssignedUser] = useState(null);
+  const [assignedDiv, setAssignedDiv] = useState(null);
 
   // UI state
   const [divisionModalOpen, setDivisionModalOpen] = useState(false);
@@ -117,8 +119,8 @@ export default function ManageStats() {
     setType("personal");
     setValueType("number");
     setReversed(false);
-    setAssignedUsers([]);
-    setAssignedDivs([]);
+    setAssignedUser(null);
+    setAssignedDiv(null);
   };
 
   const startEdit = (stat) => {
@@ -128,8 +130,30 @@ export default function ManageStats() {
     setType(stat.type || "personal");
     setValueType(stat.value_type || "number");
     setReversed(!!stat.reversed);
-    setAssignedUsers(stat.user_ids || []);
-    setAssignedDivs(stat.division_ids || []);
+
+    // Prefer single user_id (new API). Fallback to first element of user_ids if present (legacy).
+    const uid =
+      stat.user_id ??
+      (Array.isArray(stat.user_ids) && stat.user_ids.length
+        ? stat.user_ids[0]
+        : null);
+    setAssignedUser(uid || null);
+
+    // Prefer single division_id if provided by API (stat.division_id), otherwise fallback to first of division_ids array or legacy CSV string
+    let divId = null;
+    if (stat.division_id) {
+      divId = stat.division_id;
+    } else if (Array.isArray(stat.division_ids) && stat.division_ids.length) {
+      divId = stat.division_ids[0];
+    } else if (stat.division_ids && typeof stat.division_ids === "string") {
+      // legacy group_concat string, take first value if present
+      const parts = stat.division_ids.split(",");
+      if (parts.length) {
+        const parsed = parseInt(parts[0], 10);
+        if (!isNaN(parsed)) divId = parsed;
+      }
+    }
+    setAssignedDiv(divId || null);
   };
 
   const submitStat = async (e) => {
@@ -140,7 +164,8 @@ export default function ManageStats() {
       return;
     }
 
-    // Build payload and include optional fields when present
+    // Build payload and include optional fields when present.
+    // For compatibility with existing backend handlers we still send arrays, but with single element.
     const payload = {
       id: editId,
       short_id: shortId.trim().toUpperCase(),
@@ -148,8 +173,8 @@ export default function ManageStats() {
       type,
       value_type: valueType,
       reversed: !!reversed,
-      user_ids: Array.isArray(assignedUsers) ? assignedUsers : [],
-      division_ids: Array.isArray(assignedDivs) ? assignedDivs : [],
+      user_ids: assignedUser ? [assignedUser] : [],
+      division_ids: assignedDiv ? [assignedDiv] : [],
     };
 
     setLoading(true);
@@ -162,7 +187,14 @@ export default function ManageStats() {
         credentials: "include",
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = { message: text };
+      }
+
       if (res.ok) {
         showAlert("Success", data.message || "Stat saved");
         resetForm();
@@ -199,23 +231,38 @@ export default function ManageStats() {
 
   // map assigned display names safely (normalize id types to string)
   const mapAssignedNames = (stat) => {
-    const assigned = [];
-    if (stat.user_ids?.length) {
-      assigned.push(
-        ...stat.user_ids.map(
-          (id) => users.find((u) => String(u.value) === String(id))?.text || id
-        )
-      );
+    const names = [];
+
+    // Prefer single user_id if present
+    const uid =
+      stat.user_id ??
+      (Array.isArray(stat.user_ids) && stat.user_ids.length
+        ? stat.user_ids[0]
+        : null);
+    if (uid) {
+      const u = users.find((x) => String(x.value) === String(uid));
+      names.push(u ? u.text : String(uid));
     }
-    if (stat.division_ids?.length) {
-      assigned.push(
-        ...stat.division_ids.map(
-          (id) =>
-            divisions.find((d) => String(d.value) === String(id))?.text || id
-        )
-      );
+
+    // Prefer single division_id if present, otherwise fallback to division_ids[0]
+    let divId = null;
+    if (stat.division_id) {
+      divId = stat.division_id;
+    } else if (Array.isArray(stat.division_ids) && stat.division_ids.length) {
+      divId = stat.division_ids[0];
+    } else if (stat.division_ids && typeof stat.division_ids === "string") {
+      const parts = stat.division_ids.split(",");
+      if (parts.length) {
+        const parsed = parseInt(parts[0], 10);
+        if (!isNaN(parsed)) divId = parsed;
+      }
     }
-    return assigned.length ? assigned.join(", ") : "—";
+    if (divId) {
+      const d = divisions.find((x) => String(x.value) === String(divId));
+      names.push(d ? d.text : String(divId));
+    }
+
+    return names.length ? names.join(", ") : "—";
   };
 
   return (
@@ -297,28 +344,31 @@ export default function ManageStats() {
             </Form.Field>
           </Form.Group>
 
-          {/* Assign to Users */}
+          {/* Assign to a single User */}
           <Form.Field>
-            <label>Assign to Users</label>
+            <label>Assigned User</label>
             <Dropdown
-              placeholder="Select users"
+              placeholder="Select a user"
               fluid
-              multiple
               selection
               options={users}
-              value={assignedUsers}
-              onChange={(_, { value }) => setAssignedUsers(value)}
+              value={assignedUser}
+              onChange={(_, { value }) => setAssignedUser(value)}
+              clearable
             />
+            <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+              Select the single canonical user this stat is assigned to.
+            </div>
           </Form.Field>
 
-          {/* Assign to Divisions (always visible) */}
+          {/* Assign to a single Division */}
           <Form.Field>
             <label>
-              Assign to Divisions{" "}
+              Assigned Division{" "}
               <Button
                 basic
                 size="tiny"
-                type="button" // <- important: prevents submitting the parent form
+                type="button" // <- prevents submitting the parent form
                 onClick={() => setDivisionModalOpen(true)}
                 icon
               >
@@ -326,14 +376,17 @@ export default function ManageStats() {
               </Button>
             </label>
             <Dropdown
-              placeholder="Select divisions"
+              placeholder="Select a division"
               fluid
-              multiple
               selection
               options={divisions}
-              value={assignedDivs}
-              onChange={(_, { value }) => setAssignedDivs(value)}
+              value={assignedDiv}
+              onChange={(_, { value }) => setAssignedDiv(value)}
+              clearable
             />
+            <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+              Select the single division this stat belongs to.
+            </div>
           </Form.Field>
 
           <Button primary type="submit">

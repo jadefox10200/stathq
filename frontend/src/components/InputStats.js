@@ -125,6 +125,7 @@ export default function InputStats() {
   const [weeklyModalStat, setWeeklyModalStat] = useState(null);
   const [weeklyModalValue, setWeeklyModalValue] = useState("");
   const [weeklyModalSubmitting, setWeeklyModalSubmitting] = useState(false);
+  const [weeklyModalTargetUser, setWeeklyModalTargetUser] = useState(null);
 
   // history list (shown when user requests)
   const [historyList, setHistoryList] = useState([]);
@@ -201,6 +202,7 @@ export default function InputStats() {
           rows.push({
             statId: s.id,
             short_id: s.short_id,
+            username: s.username,
             full_name: s.full_name,
             type: s.type,
             Thursday: "",
@@ -216,6 +218,7 @@ export default function InputStats() {
         rows.push({
           statId: s.id,
           short_id: s.short_id,
+          username: s.username,
           full_name: s.full_name,
           type: s.type,
           Thursday: json.Thursday || "",
@@ -337,17 +340,50 @@ export default function InputStats() {
 
   // ---------- WEEKLY helpers ----------
   // load weekly history for a single stat (returns array of {Weekending, Value})
-  async function loadWeeklyHistoryForStat(statId) {
+  async function loadWeeklyHistoryForStat(statOrId) {
     setHistoryLoading(true);
     setHistoryList([]);
+    setWeeklyMessage(null);
     try {
+      let statId = null;
+      let assignedUid = null;
+
+      if (!statOrId) {
+        throw new Error("stat id required");
+      }
+
+      if (typeof statOrId === "number" || typeof statOrId === "string") {
+        statId = String(statOrId);
+      } else if (typeof statOrId === "object") {
+        // prefer id field names used in repo: id or statId
+        statId = String(statOrId.id || statOrId.statId || statOrId.ID);
+        // possible assigned user id fields
+        assignedUid =
+          statOrId.user_id ||
+          statOrId.owner_id ||
+          (Array.isArray(statOrId.user_ids) && statOrId.user_ids.length
+            ? statOrId.user_ids[0]
+            : null);
+      }
+
+      if (!statId) throw new Error("stat id missing");
+
       const params = new URLSearchParams();
-      params.set("stat_id", String(statId));
+      params.set("stat_id", statId);
+
+      // include user_id when admin and assignedUid present
+      if (isAdmin && assignedUid) {
+        params.set("user_id", String(assignedUid));
+      }
+
       const res = await fetch(
         `${API}/services/getWeeklyStats?${params.toString()}`,
         { credentials: "include" }
       );
-      if (!res.ok) throw new Error("Failed to load weekly history");
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
       const json = await res.json();
       setHistoryList(Array.isArray(json) ? json : []);
     } catch (err) {
@@ -419,32 +455,54 @@ export default function InputStats() {
   }
 
   // open weekly quick-entry modal for a stat
-  // IMPORTANT: use the currently selected weeklyWeek (no per-modal week selection)
   function openWeeklyModal(stat) {
-    // stat should include .id
+    // stat should include .id and .user_id (if assigned) and possibly .division_id
     setWeeklyModalStat(stat);
     setWeeklyModalValue(weeklyValues[stat.id] || "");
-    // DO NOT change the global weeklyWeek here; we use the currently selected week
+    // use the single DB-backed field name user_id
+    const assignedUid = stat.user_id || null;
+    console.log("uid: ", assignedUid);
+    setWeeklyModalTargetUser(assignedUid);
+
     setWeeklyModalOpen(true);
   }
 
   // submit single weekly value for the selected week (sends stat_id/date/value to new endpoint)
   async function submitWeeklySingle() {
     if (!weeklyModalStat) return;
+    setHistoryLoading(false);
     setWeeklyModalSubmitting(true);
     setWeeklyMessage(null);
     try {
+      const statId = weeklyModalStat.id || weeklyModalStat.statId || null;
+      if (!statId) throw new Error("stat id missing for selected stat");
+
       const payload = {
-        stat_id: weeklyModalStat.id || weeklyModalStat.statId || null,
-        date: weeklyWeek, // use the currently selected week
+        stat_id: statId,
+        date: weeklyWeek, // currently-selected week on the page
         value: weeklyModalValue,
       };
 
-      if (!payload.stat_id) {
-        throw new Error("stat_id is missing for selected stat");
+      // For divisional/main stats, include division_id if present in metadata
+      if (
+        isAdmin &&
+        (weeklyModalStat.type === "divisional" ||
+          weeklyModalStat.type === "main")
+      ) {
+        const divisionId = weeklyModalStat.division_id || null;
+        if (divisionId) {
+          payload.division_id = divisionId;
+        }
+        // if no division_id provided, backend will try to resolve from stats table
       }
-      if (!payload.date) {
-        throw new Error("Please select a weekending date");
+
+      // If admin is editing a personal stat that belongs to another user, include user_id
+      if (
+        isAdmin &&
+        (weeklyModalStat.type === "personal" || !weeklyModalStat.type) &&
+        weeklyModalTargetUser
+      ) {
+        payload.user_id = weeklyModalTargetUser;
       }
 
       const res = await fetch(`${API}/services/logWeeklyStats`, {
@@ -469,6 +527,8 @@ export default function InputStats() {
           json && json.message ? json.message : text || `HTTP ${res.status}`;
         setWeeklyMessage({ type: "error", text: msg });
         setWeeklyModalSubmitting(false);
+        // close the modal to match previous behaviour
+        setWeeklyModalOpen(false);
         return;
       }
 
@@ -478,6 +538,9 @@ export default function InputStats() {
 
       setWeeklyModalOpen(false);
       setWeeklyModalValue("");
+      setWeeklyModalTargetUser(null);
+
+      // refresh displayed values for the selected week
       await loadWeeklyValuesForWeek(weeklyWeek, statsMeta);
     } catch (err) {
       setWeeklyMessage({ type: "error", text: String(err) });
@@ -518,24 +581,26 @@ export default function InputStats() {
           <Table.Header>
             <Table.Row>
               <Table.HeaderCell>Stat</Table.HeaderCell>
+              <Table.HeaderCell>User</Table.HeaderCell>
               <Table.HeaderCell>Type</Table.HeaderCell>
               <Table.HeaderCell>Thursday</Table.HeaderCell>
               <Table.HeaderCell>Friday</Table.HeaderCell>
               <Table.HeaderCell>Monday</Table.HeaderCell>
               <Table.HeaderCell>Tuesday</Table.HeaderCell>
               <Table.HeaderCell>Wednesday</Table.HeaderCell>
-              <Table.HeaderCell>Actions</Table.HeaderCell>
+              {/* <Table.HeaderCell>Actions</Table.HeaderCell> */}
             </Table.Row>
           </Table.Header>
           <Table.Body>
             {dailyTable.map((r) => (
-              <Table.Row key={r.statId || `${r.short_id}-${r.full_name}`}>
+              <Table.Row key={r.statId}>
                 <Table.Cell>
                   <strong>{r.short_id}</strong>
                   <div style={{ fontSize: 12, color: "#666" }}>
                     {r.full_name}
                   </div>
                 </Table.Cell>
+                <Table.Cell>{r.username}</Table.Cell>
                 <Table.Cell>{r.type}</Table.Cell>
                 <Table.Cell>
                   <Input
@@ -602,11 +667,11 @@ export default function InputStats() {
                     }
                   />
                 </Table.Cell>
-                <Table.Cell>
+                {/* <Table.Cell>
                   <Button size="tiny" onClick={() => openTodayModal(r)}>
                     <Icon name="clock" /> Enter today's
                   </Button>
-                </Table.Cell>
+                </Table.Cell> */}
               </Table.Row>
             ))}
           </Table.Body>
@@ -665,7 +730,7 @@ export default function InputStats() {
               </Table.Header>
               <Table.Body>
                 {(statsMeta || []).map((s) => (
-                  <Table.Row key={s.id || s.short_id}>
+                  <Table.Row key={s.id}>
                     <Table.Cell>
                       <strong>{s.short_id}</strong>
                       <div style={{ fontSize: 12, color: "#666" }}>
@@ -675,7 +740,7 @@ export default function InputStats() {
                     {isAdmin && (
                       <>
                         <Table.Cell>{s.username}</Table.Cell>
-                        <Table.Cell>{s.div_name}</Table.Cell>
+                        <Table.Cell>{s.division_name}</Table.Cell>
                       </>
                     )}
 
@@ -687,7 +752,7 @@ export default function InputStats() {
                       </Button>
                       <Button
                         size="tiny"
-                        onClick={() => loadWeeklyHistoryForStat(s.id)}
+                        onClick={() => loadWeeklyHistoryForStat(s)}
                       >
                         <Icon name="list" /> History
                       </Button>
