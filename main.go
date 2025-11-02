@@ -547,10 +547,14 @@ func main() {
 
 	// Admin-only endpoints
 	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
+	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(UpdateDivisionHandler))).Methods("PATCH")
 	router.Handle("/api/divisions", AuthMiddleware("", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
 	router.Handle("/api/users", AuthMiddleware("", http.HandlerFunc(ListUsersHandler))).Methods("GET")
 	router.Handle("/api/stats/{id}/series", AuthMiddleware("", http.HandlerFunc(GetStatSeriesHandler))).Methods("GET")
 	router.Handle("/api/stats/view/all", AuthMiddleware("", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
+	
+	router.Handle("/api/public/stats/{id}/series", AuthMiddleware("", http.HandlerFunc(PublicGetStatSeriesHandler))).Methods("GET")
+	router.Handle("/api/public/stats/view/all", AuthMiddleware("", http.HandlerFunc(PublicListAllStatsHandler))).Methods("GET")
 
 	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
 	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
@@ -2193,6 +2197,212 @@ func GetStatSeriesHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"message":"invalid user_id"}`, http.StatusBadRequest)
 			return
 		}
+	}
+
+	// get stat value_type for conversion
+	var valueType string
+	if err := DB.QueryRow(`SELECT value_type FROM stats WHERE id = ? LIMIT 1`, statID).Scan(&valueType); err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, `{"message":"stat not found"}`, http.StatusNotFound)
+			return
+		}
+		webFail("Failed to query stat metadata", w, err)
+		return
+	}
+
+	// Query canonical weekly rows for the stat
+	rows, err := DB.Query(`SELECT week_ending, value, author_user_id FROM weekly_stats WHERE stat_id = ? ORDER BY week_ending`, statID)
+	if err != nil {
+		webFail("Failed to query weekly series", w, err)
+		return
+	}
+	defer rows.Close()
+
+	type seriesRow struct {
+		Weekending   string   `json:"Weekending"`
+		Value        float64  `json:"Value"`
+		AuthorUserID *int     `json:"author_user_id,omitempty"`
+	}
+
+	out := make([]seriesRow, 0)
+	for rows.Next() {
+		var we string
+		var v sql.NullInt64
+		var author sql.NullInt64
+		if err := rows.Scan(&we, &v, &author); err != nil {
+			webFail("Failed to scan weekly row", w, err)
+			return
+		}
+		if !v.Valid {
+			// skip null values (shouldn't happen for weekly_stats)
+			continue
+		}
+
+		var value float64
+		switch valueType {
+		case "currency":
+			// stored as cents -> return dollars float
+			value = float64(v.Int64) / 100.0
+		case "number":
+			value = float64(v.Int64)
+		case "percentage":
+			// stored as percent * 100 (e.g., 1234 -> 12.34)
+			value = float64(v.Int64) / 100.0
+		default:
+			value = float64(v.Int64)
+		}
+
+		var au *int
+		if author.Valid {
+			t := int(author.Int64)
+			au = &t
+		}
+		out = append(out, seriesRow{Weekending: we, Value: value, AuthorUserID: au})
+	}
+	if err := rows.Err(); err != nil {
+		webFail("Error iterating series rows", w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// ---------- UPDATE DIVISION ----------
+func UpdateDivisionHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPatch {
+        http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+        return
+    }
+
+    idStr := mux.Vars(r)["id"]
+    id, err := strconv.Atoi(idStr)
+    if err != nil {
+        webFail("Invalid division ID", w, err)
+        return
+    }
+
+    var req struct {
+        Name string `json:"name"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        webFail("Invalid JSON payload", w, err)
+        return
+    }
+
+    if strings.TrimSpace(req.Name) == "" {
+        webFail("Division name is required", w, nil)
+        return
+    }
+
+    _, err = DB.Exec(`UPDATE divisions SET name=? WHERE id = ?`, req.Name, id)
+    if err != nil {
+        webFail("Failed to update division", w, err)
+        return
+    }
+
+    json.NewEncoder(w).Encode(map[string]string{"message": "Division updated"})
+}
+
+// ---------- PUBLIC LIST ALL STATS (divisional only for Home.js) ----------
+func PublicListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := DB.Query(`
+		SELECT 
+			s.id,
+			s.short_id,
+			s.full_name,
+			s.type,
+			s.value_type,
+			s.reversed,
+			s.assigned_user_id,
+			u.username,
+			s.assigned_division_id,
+			d.name AS division_name
+		FROM stats s
+		LEFT JOIN users u ON s.assigned_user_id = u.id
+		LEFT JOIN divisions d ON s.assigned_division_id = d.id
+		WHERE s.type = 'divisional'
+		ORDER BY s.short_id
+	`)
+	if err != nil {
+		webFail("Failed to query stats", w, err)
+		return
+	}
+	defer rows.Close()
+
+	type statOut struct {
+		ID                int     `json:"id"`
+		ShortID           string  `json:"short_id"`
+		FullName          string  `json:"full_name"`
+		Type              string  `json:"type"`
+		ValueType         string  `json:"value_type"`
+		Reversed          bool    `json:"reversed"`
+		AssignedUserID    *int    `json:"user_id,omitempty"`
+		AssignedUsername  *string `json:"username,omitempty"`
+		AssignedDivision  *int    `json:"division_id,omitempty"`
+		AssignedDivName   *string `json:"division_name,omitempty"`
+	}
+	out := []statOut{}
+	for rows.Next() {
+		var s statOut
+		var assignedUID sqlNullInt64
+		var assignedUsername sqlNullString
+		var assignedDiv sqlNullInt64
+		var divName sqlNullString
+		if err := rows.Scan(&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
+			&assignedUID, &assignedUsername, &assignedDiv, &divName); err != nil {
+			webFail("Failed to scan stat row", w, err)
+			return
+		}
+		if assignedUID.Valid {
+			v := int(assignedUID.Int64)
+			s.AssignedUserID = &v
+		}
+		if assignedUsername.Valid {
+			u := assignedUsername.String
+			s.AssignedUsername = &u
+		}
+		if assignedDiv.Valid {
+			v := int(assignedDiv.Int64)
+			s.AssignedDivision = &v
+		}
+		if divName.Valid {
+			dn := divName.String
+			s.AssignedDivName = &dn
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		webFail("Error iterating stats", w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// ---------- PUBLIC GET STAT SERIES ----------
+func PublicGetStatSeriesHandler(w http.ResponseWriter, r *http.Request) {
+	// require auth (router will wrap via AuthMiddleware)
+	vars := mux.Vars(r)
+	idStr := vars["id"]
+	if idStr == "" {
+		http.Error(w, `{"message":"stat id required"}`, http.StatusBadRequest)
+		return
+	}
+	statID, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, `{"message":"invalid stat id"}`, http.StatusBadRequest)
+		return
+	}
+
+	// view param (only weekly supported now)
+	view := r.URL.Query().Get("view")
+	if view == "" {
+		view = "weekly"
+	}
+	if view != "weekly" {
+		http.Error(w, `{"message":"only 'weekly' view is implemented"}`, http.StatusNotImplemented)
+		return
 	}
 
 	// get stat value_type for conversion

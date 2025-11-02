@@ -266,187 +266,192 @@ export default function ManageStats() {
   };
 
   return (
-    <div className="ui container" style={{ marginTop: "2rem" }}>
-      <Header as="h1" textAlign="center">
-        Manage Stats
-      </Header>
-
-      {/* Create / Edit Form */}
-      <div className="ui raised segment">
-        <Header as="h3" dividing>
-          {editId ? "Edit Stat" : "Create New Stat"}
+    <>
+      <div className="ui container" style={{ marginTop: "2rem" }}>
+        <Header as="h1" textAlign="center">
+          Manage Stats
         </Header>
 
-        <Form onSubmit={submitStat} loading={loading}>
-          <Form.Group widths="equal">
-            <Form.Field required>
-              <label>Short ID (e.g. GI)</label>
-              <Input
-                placeholder="GI"
-                value={shortId}
-                onChange={(e) => setShortId(e.target.value)}
-              />
-            </Form.Field>
-            <Form.Field required>
-              <label>Full Name</label>
-              <Input
-                placeholder="Gross Income"
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-              />
-            </Form.Field>
-          </Form.Group>
+        {/* Create / Edit Form */}
+        <div className="ui raised segment">
+          <Header as="h3" dividing>
+            {editId ? "Edit Stat" : "Create New Stat"}
+          </Header>
 
-          <Form.Group widths="equal">
-            <Form.Field required>
-              <label>Type</label>
-              <Dropdown
-                selection
-                options={[
-                  { key: "personal", text: "Personal", value: "personal" },
-                  {
-                    key: "divisional",
-                    text: "Divisional",
-                    value: "divisional",
-                  },
-                  { key: "main", text: "Main (Company)", value: "main" },
-                ]}
-                value={type}
-                onChange={(_, { value }) => setType(value)}
-              />
-            </Form.Field>
+          <Form onSubmit={submitStat} loading={loading}>
+            <Form.Group widths="equal">
+              <Form.Field required>
+                <label>Short ID (e.g. GI)</label>
+                <Input
+                  placeholder="GI"
+                  value={shortId}
+                  onChange={(e) => setShortId(e.target.value)}
+                />
+              </Form.Field>
+              <Form.Field required>
+                <label>Full Name</label>
+                <Input
+                  placeholder="Gross Income"
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                />
+              </Form.Field>
+            </Form.Group>
 
-            <Form.Field required>
-              <label>Value Type</label>
-              <Dropdown
-                selection
-                options={[
-                  { key: "number", text: "Number", value: "number" },
-                  { key: "currency", text: "Currency ($)", value: "currency" },
-                  {
-                    key: "percentage",
-                    text: "Percentage (%)",
-                    value: "percentage",
-                  },
-                ]}
-                value={valueType}
-                onChange={(_, { value }) => setValueType(value)}
-              />
-            </Form.Field>
+            <Form.Group widths="equal">
+              <Form.Field required>
+                <label>Type</label>
+                <Dropdown
+                  selection
+                  options={[
+                    { key: "personal", text: "Personal", value: "personal" },
+                    {
+                      key: "divisional",
+                      text: "Divisional",
+                      value: "divisional",
+                    },
+                    { key: "main", text: "Main (Company)", value: "main" },
+                  ]}
+                  value={type}
+                  onChange={(_, { value }) => setType(value)}
+                />
+              </Form.Field>
 
+              <Form.Field required>
+                <label>Value Type</label>
+                <Dropdown
+                  selection
+                  options={[
+                    { key: "number", text: "Number", value: "number" },
+                    {
+                      key: "currency",
+                      text: "Currency ($)",
+                      value: "currency",
+                    },
+                    {
+                      key: "percentage",
+                      text: "Percentage (%)",
+                      value: "percentage",
+                    },
+                  ]}
+                  value={valueType}
+                  onChange={(_, { value }) => setValueType(value)}
+                />
+              </Form.Field>
+
+              <Form.Field>
+                <label>Reversed (upside-down)</label>
+                <Checkbox
+                  toggle
+                  checked={reversed}
+                  onChange={(_, { checked }) => setReversed(!!checked)}
+                />
+              </Form.Field>
+            </Form.Group>
+
+            {/* Assign to a single User */}
             <Form.Field>
-              <label>Reversed (upside-down)</label>
-              <Checkbox
-                toggle
-                checked={reversed}
-                onChange={(_, { checked }) => setReversed(!!checked)}
+              <label>Assigned User</label>
+              <Dropdown
+                placeholder="Select a user"
+                fluid
+                selection
+                options={users}
+                value={assignedUser}
+                onChange={(_, { value }) => setAssignedUser(value)}
+                clearable
               />
+              <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+                Select the single canonical user this stat is assigned to.
+              </div>
             </Form.Field>
-          </Form.Group>
 
-          {/* Assign to a single User */}
-          <Form.Field>
-            <label>Assigned User</label>
-            <Dropdown
-              placeholder="Select a user"
-              fluid
-              selection
-              options={users}
-              value={assignedUser}
-              onChange={(_, { value }) => setAssignedUser(value)}
-              clearable
-            />
-            <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-              Select the single canonical user this stat is assigned to.
-            </div>
-          </Form.Field>
+            {/* Assign to a single Division */}
+            <Form.Field>
+              <label>
+                Assigned Division{" "}
+                <Button
+                  basic
+                  size="tiny"
+                  type="button" // <- prevents submitting the parent form
+                  onClick={() => setDivisionModalOpen(true)}
+                  icon
+                >
+                  <Icon name="cogs" /> Manage
+                </Button>
+              </label>
+              <Dropdown
+                placeholder="Select a division"
+                fluid
+                selection
+                options={divisions}
+                value={assignedDiv}
+                onChange={(_, { value }) => setAssignedDiv(value)}
+                clearable
+              />
+              <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+                Select the single division this stat belongs to.
+              </div>
+            </Form.Field>
 
-          {/* Assign to a single Division */}
-          <Form.Field>
-            <label>
-              Assigned Division{" "}
-              <Button
-                basic
-                size="tiny"
-                type="button" // <- prevents submitting the parent form
-                onClick={() => setDivisionModalOpen(true)}
-                icon
-              >
-                <Icon name="cogs" /> Manage
-              </Button>
-            </label>
-            <Dropdown
-              placeholder="Select a division"
-              fluid
-              selection
-              options={divisions}
-              value={assignedDiv}
-              onChange={(_, { value }) => setAssignedDiv(value)}
-              clearable
-            />
-            <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-              Select the single division this stat belongs to.
-            </div>
-          </Form.Field>
-
-          <Button primary type="submit">
-            {editId ? "Update Stat" : "Create Stat"}
-          </Button>
-          {editId && (
-            <Button type="button" onClick={resetForm}>
-              Cancel
+            <Button primary type="submit">
+              {editId ? "Update Stat" : "Create Stat"}
             </Button>
-          )}
-        </Form>
-      </div>
+            {editId && (
+              <Button type="button" onClick={resetForm}>
+                Cancel
+              </Button>
+            )}
+          </Form>
+        </div>
 
-      {/* List of Stats */}
-      <div className="ui raised segment" style={{ marginTop: "2rem" }}>
-        <Header as="h3" dividing>
-          Existing Stats
-        </Header>
-        <Table celled structured>
-          <Table.Header>
-            <Table.Row>
-              <Table.HeaderCell>Short ID</Table.HeaderCell>
-              <Table.HeaderCell>Full Name</Table.HeaderCell>
-              <Table.HeaderCell>Type</Table.HeaderCell>
-              <Table.HeaderCell>Value Type</Table.HeaderCell>
-              <Table.HeaderCell>Reversed</Table.HeaderCell>
-              <Table.HeaderCell>Assigned To</Table.HeaderCell>
-              <Table.HeaderCell>Actions</Table.HeaderCell>
-            </Table.Row>
-          </Table.Header>
-          <Table.Body>
-            {stats.map((s) => (
-              <Table.Row key={s.id}>
-                <Table.Cell>
-                  <strong>{s.short_id}</strong>
-                </Table.Cell>
-                <Table.Cell>{s.full_name}</Table.Cell>
-                <Table.Cell>{s.type}</Table.Cell>
-                <Table.Cell>{s.value_type}</Table.Cell>
-                <Table.Cell>{s.reversed ? "Yes" : "No"}</Table.Cell>
-                <Table.Cell>{mapAssignedNames(s)}</Table.Cell>
-                <Table.Cell>
-                  <Button
-                    size="mini"
-                    icon="edit"
-                    onClick={() => startEdit(s)}
-                  />
-                  <Button
-                    size="mini"
-                    icon="trash"
-                    negative
-                    onClick={() => deleteStat(s.id, s.full_name)}
-                  />
-                </Table.Cell>
+        {/* List of Stats */}
+        <div className="ui raised segment" style={{ marginTop: "2rem" }}>
+          <Header as="h3" dividing>
+            Existing Stats
+          </Header>
+          <Table celled structured>
+            <Table.Header>
+              <Table.Row>
+                <Table.HeaderCell>Short ID</Table.HeaderCell>
+                <Table.HeaderCell>Full Name</Table.HeaderCell>
+                <Table.HeaderCell>Type</Table.HeaderCell>
+                <Table.HeaderCell>Value Type</Table.HeaderCell>
+                <Table.HeaderCell>Reversed</Table.HeaderCell>
+                <Table.HeaderCell>Assigned To</Table.HeaderCell>
+                <Table.HeaderCell>Actions</Table.HeaderCell>
               </Table.Row>
-            ))}
-          </Table.Body>
-        </Table>
+            </Table.Header>
+            <Table.Body>
+              {stats.map((s) => (
+                <Table.Row key={s.id}>
+                  <Table.Cell>
+                    <strong>{s.short_id}</strong>
+                  </Table.Cell>
+                  <Table.Cell>{s.full_name}</Table.Cell>
+                  <Table.Cell>{s.type}</Table.Cell>
+                  <Table.Cell>{s.value_type}</Table.Cell>
+                  <Table.Cell>{s.reversed ? "Yes" : "No"}</Table.Cell>
+                  <Table.Cell>{mapAssignedNames(s)}</Table.Cell>
+                  <Table.Cell>
+                    <Button
+                      size="mini"
+                      icon="edit"
+                      onClick={() => startEdit(s)}
+                    />
+                    <Button
+                      size="mini"
+                      icon="trash"
+                      negative
+                      onClick={() => deleteStat(s.id, s.full_name)}
+                    />
+                  </Table.Cell>
+                </Table.Row>
+              ))}
+            </Table.Body>
+          </Table>
+        </div>
       </div>
-
       {/* Division Manager modal (react) */}
       <DivisionManager
         open={divisionModalOpen}
@@ -469,6 +474,6 @@ export default function ManageStats() {
           <Button onClick={() => setAlertOpen(false)}>OK</Button>
         </Modal.Actions>
       </Modal>
-    </div>
+    </>
   );
 }

@@ -15,6 +15,10 @@ export default function DivisionManager({
   const [pendingDelete, setPendingDelete] = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // For editing
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+
   // Clear and focus input when modal opens
   useEffect(() => {
     if (open) {
@@ -52,6 +56,47 @@ export default function DivisionManager({
       showAlert?.("Network Error", "Could not create division");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const startEdit = (id, name) => {
+    setEditingId(id);
+    setEditName(name);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditName("");
+  };
+
+  const saveEdit = async (id) => {
+    const name = editName.trim();
+    if (!name) {
+      showAlert?.("Validation", "Division name is required");
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await fetch(`${API}/api/divisions/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        await refreshDivisions();
+        showAlert?.("Success", data.message || "Division updated");
+      } else {
+        showAlert?.("Error", data.message || "Failed to update division");
+      }
+    } catch (err) {
+      console.error(err);
+      showAlert?.("Network Error", "Could not update division");
+    } finally {
+      setLoading(false);
+      setEditingId(null);
+      setEditName("");
     }
   };
 
@@ -133,17 +178,53 @@ export default function DivisionManager({
             divisions.map((d) => (
               <List.Item key={d.key}>
                 <List.Content floated="right">
-                  <Button
-                    icon
-                    size="mini"
-                    negative
-                    type="button" // safe: prevent accidental form submit
-                    onClick={() => askDelete({ id: d.value, name: d.text })}
-                  >
-                    <Icon name="trash" />
-                  </Button>
+                  {editingId === d.value ? (
+                    <>
+                      <Button
+                        icon
+                        size="mini"
+                        onClick={() => saveEdit(d.value)}
+                      >
+                        <Icon name="check" />
+                      </Button>
+                      <Button icon size="mini" onClick={cancelEdit}>
+                        <Icon name="cancel" />
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <Button
+                        icon
+                        size="mini"
+                        onClick={() => startEdit(d.value, d.text)}
+                      >
+                        <Icon name="edit" />
+                      </Button>
+                      <Button
+                        icon
+                        size="mini"
+                        negative
+                        onClick={() => askDelete({ id: d.value, name: d.text })}
+                      >
+                        <Icon name="trash" />
+                      </Button>
+                    </>
+                  )}
                 </List.Content>
-                <List.Content>{d.text}</List.Content>
+                <List.Content>
+                  {editingId === d.value ? (
+                    <Input
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") saveEdit(d.value);
+                        if (e.key === "Escape") cancelEdit();
+                      }}
+                    />
+                  ) : (
+                    d.text
+                  )}
+                </List.Content>
               </List.Item>
             ))
           ) : (

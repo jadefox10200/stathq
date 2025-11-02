@@ -158,16 +158,17 @@ export default function ViewStats() {
   const statOptions = useMemo(() => {
     let filteredStats = stats;
     if (filterType === "user") {
-      if (selectedUser) {
+      if (selectedUser && selectedUser !== "all") {
         filteredStats = stats.filter((s) => s.user_id === selectedUser);
       } else {
         filteredStats = stats.filter((s) => s.type === "personal");
       }
     } else if (filterType === "division") {
-      if (selectedDivision) {
-        filteredStats = stats.filter((s) => s.division_id === selectedDivision);
-      } else {
-        filteredStats = stats.filter((s) => s.type === "divisional");
+      filteredStats = stats.filter((s) => s.type === "divisional");
+      if (selectedDivision && selectedDivision !== "all") {
+        filteredStats = filteredStats.filter(
+          (s) => s.division_id === selectedDivision
+        );
       }
     }
     // For "all", no filter
@@ -293,7 +294,9 @@ export default function ViewStats() {
               {filterType === "division" && (
                 <div
                   style={{
+                    display: "flex",
                     marginTop: 8,
+                    gap: 8,
                   }}
                 >
                   <Dropdown
@@ -307,6 +310,13 @@ export default function ViewStats() {
                       // No need to loadData here, as it filters the stat options
                     }}
                   />
+                  <Button
+                    onClick={() => {
+                      setSelectedDivision("");
+                    }}
+                  >
+                    Clear
+                  </Button>
                 </div>
               )}
             </Grid.Column>
