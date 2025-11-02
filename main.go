@@ -546,6 +546,12 @@ func main() {
 	router.Handle("/services/logWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleLogWeeklyStats)))
 
 	// Admin-only endpoints
+	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
+	router.Handle("/api/divisions", AuthMiddleware("", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
+	router.Handle("/api/users", AuthMiddleware("", http.HandlerFunc(ListUsersHandler))).Methods("GET")
+	router.Handle("/api/stats/{id}/series", AuthMiddleware("", http.HandlerFunc(GetStatSeriesHandler))).Methods("GET")
+	router.Handle("/api/stats/view/all", AuthMiddleware("", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
+
 	router.Handle("/users", AuthMiddleware("admin", http.HandlerFunc(UserHandler)))
 	router.Handle("/api/users", AuthMiddleware("admin", http.HandlerFunc(ListUsersHandler)))
 	router.Handle("/api/users/reset-password", AuthMiddleware("admin", http.HandlerFunc(ResetPasswordHandler)))
@@ -557,13 +563,9 @@ func main() {
 	router.Handle("/api/stats/all", AuthMiddleware("admin", http.HandlerFunc(ListAllStatsHandler))).Methods("GET")
 	// NEW: assigned stats endpoint for non-admin users
 	router.Handle("/api/stats/assigned", AuthMiddleware("", http.HandlerFunc(ListAssignedStatsHandler))).Methods("GET")
-	// Add after your other API routes:
-	router.Handle("/api/stats/{id}/series", AuthMiddleware("", http.HandlerFunc(GetStatSeriesHandler))).Methods("GET")
+	// Add after your other API routes:)
 
 	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(CreateDivisionHandler))).Methods("POST")
-	router.Handle("/api/divisions/{id}", AuthMiddleware("admin", http.HandlerFunc(DeleteDivisionHandler))).Methods("DELETE")
-	router.Handle("/api/divisions", AuthMiddleware("admin", http.HandlerFunc(ListDivisionsHandler))).Methods("GET")
-
 	// User info endpoint
 	router.Handle("/api/user", AuthMiddleware("", http.HandlerFunc(UserInfoHandler)))
 
