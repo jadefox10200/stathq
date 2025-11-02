@@ -89,6 +89,7 @@ export default function ViewStats() {
     };
   }, []);
 
+  //loadData({ filterType: "user", user: value });
   async function loadData(opts = {}) {
     if (!selectedStatId && !opts.statId) {
       setData([]);
@@ -139,29 +140,44 @@ export default function ViewStats() {
     const meta = stats.find((s) => String(s.id) === String(value));
     setSelectedStatMeta(meta || null);
 
-    if (meta) {
-      if (meta.type === "personal") {
-        setFilterType("canonical");
-        if (meta.user_id) setSelectedUser(meta.user_id);
-      } else if (meta.type === "divisional") {
-        setFilterType("division");
-        if (meta.division_id) setSelectedDivision(meta.division_id);
-      } else {
-        setFilterType("canonical");
-      }
-    }
+    // if (meta) {
+    //   if (meta.type === "personal") {
+    //     setFilterType("canonical");
+    //     console.log(meta);
+    //     if (meta.user_id) setSelectedUser(meta.user_id);
+    //   } else if (meta.type === "divisional") {
+    //     setFilterType("division");
+    //     if (meta.division_id) setSelectedDivision(meta.division_id);
+    //   } else {
+    //     setFilterType("canonical");
+    //   }
+    // }
     loadData({ statId: value });
   }
 
-  const statOptions = useMemo(
-    () =>
-      stats.map((s) => ({
-        key: s.id,
-        text: `${s.short_id} — ${s.full_name} (${s.type || "personal"})`,
-        value: s.id,
-      })),
-    [stats]
-  );
+  const statOptions = useMemo(() => {
+    let filteredStats = stats;
+    if (filterType === "user") {
+      if (selectedUser) {
+        filteredStats = stats.filter((s) => s.user_id === selectedUser);
+      } else {
+        filteredStats = stats.filter((s) => s.type === "personal");
+      }
+    } else if (filterType === "division") {
+      if (selectedDivision) {
+        filteredStats = stats.filter((s) => s.division_id === selectedDivision);
+      } else {
+        filteredStats = stats.filter((s) => s.type === "divisional");
+      }
+    }
+    // For "all", no filter
+    return filteredStats.map((s) => ({
+      key: s.id,
+      text: `${s.short_id} — ${s.full_name} (${s.type || "personal"})`,
+      value: s.id,
+    }));
+  }, [stats, filterType, selectedDivision, selectedUser]);
+
   const userOptions = useMemo(
     () => users.map((u) => ({ key: u.id, text: u.username, value: u.id })),
     [users]
@@ -221,14 +237,20 @@ export default function ViewStats() {
                 <Button
                   toggle
                   active={filterType === "user"}
-                  onClick={() => setFilterType("user")}
+                  onClick={() => {
+                    setFilterType("user");
+                    setSelectedDivision(null); // reset division when switching to user
+                  }}
                 >
                   Personal
                 </Button>
                 <Button
                   toggle
                   active={filterType === "division"}
-                  onClick={() => setFilterType("division")}
+                  onClick={() => {
+                    setFilterType("division");
+                    setSelectedUser(null); // reset user when switching to division
+                  }}
                 >
                   Division
                 </Button>
@@ -237,7 +259,8 @@ export default function ViewStats() {
                   active={filterType === "all"}
                   onClick={() => {
                     setFilterType("all");
-                    loadData();
+                    setSelectedUser(null);
+                    setSelectedDivision(null);
                   }}
                 >
                   All
@@ -245,7 +268,7 @@ export default function ViewStats() {
               </div>
 
               {filterType === "user" && (
-                <div style={{ marginTop: 8 }}>
+                <div style={{ display: "flex", marginTop: 8, gap: 8 }}>
                   <Dropdown
                     placeholder="Select user"
                     search
@@ -254,14 +277,25 @@ export default function ViewStats() {
                     value={selectedUser}
                     onChange={(_, { value }) => {
                       setSelectedUser(value);
-                      loadData({ filterType: "user", user: value });
+                      //loadData({ filterType: "user", user: value });
                     }}
                   />
+                  <Button
+                    onClick={() => {
+                      setSelectedUser("");
+                    }}
+                  >
+                    Clear
+                  </Button>
                 </div>
               )}
 
               {filterType === "division" && (
-                <div style={{ marginTop: 8 }}>
+                <div
+                  style={{
+                    marginTop: 8,
+                  }}
+                >
                   <Dropdown
                     placeholder="Select division"
                     search
@@ -270,7 +304,7 @@ export default function ViewStats() {
                     value={selectedDivision}
                     onChange={(_, { value }) => {
                       setSelectedDivision(value);
-                      loadData();
+                      // No need to loadData here, as it filters the stat options
                     }}
                   />
                 </div>
@@ -291,7 +325,11 @@ export default function ViewStats() {
             content="No data to display. Choose a stat and click Refresh."
           />
         ) : (
-          <ChartLine data={data} height={360} />
+          <ChartLine
+            data={data}
+            height={360}
+            reversed={selectedStatMeta?.reversed || false}
+          />
         )}
       </Segment>
 

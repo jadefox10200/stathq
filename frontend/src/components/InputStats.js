@@ -717,12 +717,10 @@ export default function InputStats() {
               <Table.Header>
                 <Table.Row>
                   <Table.HeaderCell>Stat</Table.HeaderCell>
-                  {isAdmin && (
-                    <>
-                      <Table.HeaderCell>User</Table.HeaderCell>
-                      <Table.HeaderCell>Division</Table.HeaderCell>
-                    </>
-                  )}
+
+                  <Table.HeaderCell>User</Table.HeaderCell>
+                  <Table.HeaderCell>Division</Table.HeaderCell>
+
                   <Table.HeaderCell>Type</Table.HeaderCell>
                   <Table.HeaderCell>Value</Table.HeaderCell>
                   <Table.HeaderCell>Actions</Table.HeaderCell>
@@ -737,12 +735,9 @@ export default function InputStats() {
                         {s.full_name}
                       </div>
                     </Table.Cell>
-                    {isAdmin && (
-                      <>
-                        <Table.Cell>{s.username}</Table.Cell>
-                        <Table.Cell>{s.division_name}</Table.Cell>
-                      </>
-                    )}
+
+                    <Table.Cell>{s.username}</Table.Cell>
+                    <Table.Cell>{s.division_name}</Table.Cell>
 
                     <Table.Cell>{s.type}</Table.Cell>
                     <Table.Cell>{weeklyValues[s.id] ?? ""}</Table.Cell>

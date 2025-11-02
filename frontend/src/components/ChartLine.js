@@ -41,6 +41,7 @@ export default function ChartLine({
   },
   labelInterval = 1,
   pointRadius = 3,
+  reversed = false,
 }) {
   if (!Array.isArray(data) || data.length === 0) return null;
 
@@ -63,6 +64,11 @@ export default function ChartLine({
 
   // Precompute colors per segment based on whether the next point > current point.
   const segmentColors = data.slice(0, -1).map((d, i) => {
+    if (reversed) {
+      return Number(data[i + 1][yKey]) < Number(d[yKey])
+        ? "#000000"
+        : "#d9534f";
+    }
     return Number(data[i + 1][yKey]) > Number(d[yKey]) ? "#000000" : "#d9534f";
   });
 
@@ -109,7 +115,7 @@ export default function ChartLine({
               type="category"
               allowDuplicatedCategory={false}
             />
-            <YAxis />
+            <YAxis reversed={reversed} />
             {/* <Tooltip formatter={(v) => valueFormatter(Number(v))} /> */}
             <Line
               type="linear"
@@ -142,7 +148,7 @@ export default function ChartLine({
             allowDuplicatedCategory={false}
             interval="preserveStartEnd"
           />
-          <YAxis />
+          <YAxis reversed={reversed} />
           {/* <Tooltip formatter={(v) => valueFormatter(Number(v))} /> */}
           {/* Render each segment as a separate Line */}
           {data.slice(0, -1).map((_, i) => (
