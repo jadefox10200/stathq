@@ -588,92 +588,102 @@ export default function InputStats() {
               <Table.HeaderCell>Monday</Table.HeaderCell>
               <Table.HeaderCell>Tuesday</Table.HeaderCell>
               <Table.HeaderCell>Wednesday</Table.HeaderCell>
+              <Table.HeaderCell>Total</Table.HeaderCell>
               {/* <Table.HeaderCell>Actions</Table.HeaderCell> */}
             </Table.Row>
           </Table.Header>
           <Table.Body>
-            {dailyTable.map((r) => (
-              <Table.Row key={r.statId}>
-                <Table.Cell>
-                  <strong>{r.short_id}</strong>
-                  <div style={{ fontSize: 12, color: "#666" }}>
-                    {r.full_name}
-                  </div>
-                </Table.Cell>
-                <Table.Cell>{r.username}</Table.Cell>
-                <Table.Cell>{r.type}</Table.Cell>
-                <Table.Cell>
-                  <Input
-                    fluid
-                    value={r.Thursday || ""}
-                    onChange={(e) =>
-                      setDailyTable((prev) =>
-                        prev.map((x) =>
-                          x === r ? { ...x, Thursday: e.target.value } : x
+            {dailyTable.map((r) => {
+              const total =
+                (parseFloat(r.Thursday) || 0) +
+                (parseFloat(r.Friday) || 0) +
+                (parseFloat(r.Monday) || 0) +
+                (parseFloat(r.Tuesday) || 0) +
+                (parseFloat(r.Wednesday) || 0);
+              return (
+                <Table.Row key={r.statId}>
+                  <Table.Cell>
+                    <strong>{r.short_id}</strong>
+                    <div style={{ fontSize: 12, color: "#666" }}>
+                      {r.full_name}
+                    </div>
+                  </Table.Cell>
+                  <Table.Cell>{r.username}</Table.Cell>
+                  <Table.Cell>{r.type}</Table.Cell>
+                  <Table.Cell>
+                    <Input
+                      fluid
+                      value={r.Thursday || ""}
+                      onChange={(e) =>
+                        setDailyTable((prev) =>
+                          prev.map((x) =>
+                            x === r ? { ...x, Thursday: e.target.value } : x
+                          )
                         )
-                      )
-                    }
-                  />
-                </Table.Cell>
-                <Table.Cell>
-                  <Input
-                    fluid
-                    value={r.Friday || ""}
-                    onChange={(e) =>
-                      setDailyTable((prev) =>
-                        prev.map((x) =>
-                          x === r ? { ...x, Friday: e.target.value } : x
+                      }
+                    />
+                  </Table.Cell>
+                  <Table.Cell>
+                    <Input
+                      fluid
+                      value={r.Friday || ""}
+                      onChange={(e) =>
+                        setDailyTable((prev) =>
+                          prev.map((x) =>
+                            x === r ? { ...x, Friday: e.target.value } : x
+                          )
                         )
-                      )
-                    }
-                  />
-                </Table.Cell>
-                <Table.Cell>
-                  <Input
-                    fluid
-                    value={r.Monday || ""}
-                    onChange={(e) =>
-                      setDailyTable((prev) =>
-                        prev.map((x) =>
-                          x === r ? { ...x, Monday: e.target.value } : x
+                      }
+                    />
+                  </Table.Cell>
+                  <Table.Cell>
+                    <Input
+                      fluid
+                      value={r.Monday || ""}
+                      onChange={(e) =>
+                        setDailyTable((prev) =>
+                          prev.map((x) =>
+                            x === r ? { ...x, Monday: e.target.value } : x
+                          )
                         )
-                      )
-                    }
-                  />
-                </Table.Cell>
-                <Table.Cell>
-                  <Input
-                    fluid
-                    value={r.Tuesday || ""}
-                    onChange={(e) =>
-                      setDailyTable((prev) =>
-                        prev.map((x) =>
-                          x === r ? { ...x, Tuesday: e.target.value } : x
+                      }
+                    />
+                  </Table.Cell>
+                  <Table.Cell>
+                    <Input
+                      fluid
+                      value={r.Tuesday || ""}
+                      onChange={(e) =>
+                        setDailyTable((prev) =>
+                          prev.map((x) =>
+                            x === r ? { ...x, Tuesday: e.target.value } : x
+                          )
                         )
-                      )
-                    }
-                  />
-                </Table.Cell>
-                <Table.Cell>
-                  <Input
-                    fluid
-                    value={r.Wednesday || ""}
-                    onChange={(e) =>
-                      setDailyTable((prev) =>
-                        prev.map((x) =>
-                          x === r ? { ...x, Wednesday: e.target.value } : x
+                      }
+                    />
+                  </Table.Cell>
+                  <Table.Cell>
+                    <Input
+                      fluid
+                      value={r.Wednesday || ""}
+                      onChange={(e) =>
+                        setDailyTable((prev) =>
+                          prev.map((x) =>
+                            x === r ? { ...x, Wednesday: e.target.value } : x
+                          )
                         )
-                      )
-                    }
-                  />
-                </Table.Cell>
-                {/* <Table.Cell>
+                      }
+                    />
+                  </Table.Cell>
+                  <Table.Cell>{total.toFixed(2)}</Table.Cell>
+                  {/* <Table.Cell>
                   <Button size="tiny" onClick={() => openTodayModal(r)}>
                     <Icon name="clock" /> Enter today's
                   </Button>
                 </Table.Cell> */}
-              </Table.Row>
-            ))}
+                </Table.Row>
+              );
+            })}
           </Table.Body>
         </Table>
         <div style={{ marginTop: 12 }}>

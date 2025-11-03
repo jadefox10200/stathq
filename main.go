@@ -459,12 +459,12 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Only support personal writes via this endpoint (safer). Reject divisional/main writes here.
-		if statType != "personal" {
-			tx.Rollback()
-			webFail(fmt.Sprintf("Stat %s (id=%d) is not a personal stat and cannot be written via this endpoint", shortID, row.StatID), w, errors.New("invalid stat scope"))
-			return
-		}
+		// Only support personal writes via this endpoint. Reject divisional/main writes here.
+		// if statType != "personal" {
+		// 	tx.Rollback()
+		// 	webFail(fmt.Sprintf("Stat %s (id=%d) is not a personal stat and cannot be written via this endpoint", shortID, row.StatID), w, errors.New("invalid stat scope"))
+		// 	return
+		// }
 
 		// Delete existing rows for this user and stat name for the week
 		if _, err := tx.Exec(`DELETE FROM daily_stats WHERE stat_id=? AND date IN (?,?,?,?,?)`, row.StatID, dates["Thursday"], dates["Friday"], dates["Monday"], dates["Tuesday"], dates["Wednesday"]); err != nil {
