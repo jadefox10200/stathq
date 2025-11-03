@@ -1115,6 +1115,10 @@ func UpdateUserRoleHandler(w http.ResponseWriter, r *http.Request) {
 
 // LoginHandler handles login requests
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
+	    if r.Method == http.MethodGet {
+        handleIndex(w, r)  // Serve the React app for GET requests
+        return
+    }
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
 		return
@@ -1169,6 +1173,10 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 // LogoutHandler clears the session
 func LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+        handleIndex(w, r)  // Serve the React app for GET requests
+        return
+    }
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"message": "Method not allowed"}`, http.StatusMethodNotAllowed)
 		return
