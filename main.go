@@ -579,7 +579,7 @@ func main() {
 	// Auth endpoints (unprotected)
 	router.HandleFunc("/login", LoginHandler)
 	router.HandleFunc("/logout", LogoutHandler)
-	router.HandleFunc("/register", RegisterHandler)
+	// router.HandleFunc("/register", RegisterHandler)
 
 	// Static file handlers left as-is
 	cssHandler := http.FileServer(http.Dir("public/css"))

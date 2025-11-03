@@ -68,9 +68,9 @@ export default function Login() {
         <Button type="submit" primary>
           Login
         </Button>
-        <Button as={NavLink} to="/register" secondary>
+        {/* <Button as={NavLink} to="/register" secondary>
           Register
-        </Button>
+        </Button> */}
       </Form>
     </div>
   );
