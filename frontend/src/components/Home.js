@@ -17,6 +17,11 @@ export default function Home() {
           credentials: "include",
         });
         if (!sRes.ok) {
+          if (sRes.status === 401 || sRes.status === 403) {
+            // Session invalid: redirect to login
+            window.location.href = "/login";
+            return;
+          }
           throw new Error(`Failed to load stats (status ${sRes.status})`);
         }
         const sJson = await sRes.json();
