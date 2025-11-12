@@ -27,6 +27,7 @@ Behavior:
 - Each dot is colored: black if next point > this point, red if next point <= this point.
 - Labels for each point are rendered above the point (black).
 - Line segments are colored: black if the next point > current point (value went up), red otherwise.
+- Added margins to prevent labels from being cut off (especially on the right and top).
 */
 export default function ChartLine({
   data = [],
@@ -108,7 +109,10 @@ export default function ChartLine({
     return (
       <div style={{ width: "100%", height }}>
         <ResponsiveContainer>
-          <LineChart data={only}>
+          <LineChart
+            data={only}
+            margin={{ top: 20, right: 30, left: 20, bottom: 5 }}
+          >
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis
               dataKey={xKey}
@@ -140,7 +144,10 @@ export default function ChartLine({
   return (
     <div style={{ width: "100%", height }}>
       <ResponsiveContainer>
-        <LineChart data={data}>
+        <LineChart
+          data={data}
+          margin={{ top: 20, right: 30, left: 20, bottom: 5 }}
+        >
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis
             dataKey={xKey}
