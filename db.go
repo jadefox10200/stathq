@@ -69,8 +69,19 @@ func InitDB() {
 		reversed BOOLEAN NOT NULL DEFAULT 0,
 		assigned_user_id INTEGER,       -- canonical assigned user (nullable)
 		assigned_division_id INTEGER,   -- canonical assigned division (nullable)
+		is_calculated BOOLEAN NOT NULL DEFAULT 0,  -- true if this stat sums others
 		FOREIGN KEY(assigned_user_id) REFERENCES users(id) ON DELETE SET NULL,
 		FOREIGN KEY(assigned_division_id) REFERENCES divisions(id) ON DELETE SET NULL
+	);
+
+	-- New table for calculated stat relationships
+	CREATE TABLE IF NOT EXISTS stat_calculations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		stat_id INTEGER NOT NULL,              -- the calculated stat (e.g., Total VSD)
+		dependent_stat_id INTEGER NOT NULL,    -- a stat it depends on (e.g., Extinguisher VSD)
+		FOREIGN KEY (stat_id) REFERENCES stats(id) ON DELETE CASCADE,
+		FOREIGN KEY (dependent_stat_id) REFERENCES stats(id) ON DELETE CASCADE,
+		UNIQUE(stat_id, dependent_stat_id)     -- prevent duplicate relationships
 	);
 
 	-- Optional historical assignment tables (compatibility)

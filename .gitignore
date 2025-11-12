@@ -46,3 +46,4 @@ logs
 
 node_modules
 bower_components
+public/build/*

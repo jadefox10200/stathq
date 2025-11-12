@@ -205,6 +205,7 @@ export default function InputStats() {
             username: s.username,
             full_name: s.full_name,
             type: s.type,
+            is_calculated: s.is_calculated, // <-- Add this
             Thursday: "",
             Friday: "",
             Monday: "",
@@ -221,6 +222,7 @@ export default function InputStats() {
           username: s.username,
           full_name: s.full_name,
           type: s.type,
+          is_calculated: s.is_calculated, // <-- Add this
           Thursday: json.Thursday || "",
           Friday: json.Friday || "",
           Monday: json.Monday || "",
@@ -238,21 +240,23 @@ export default function InputStats() {
     }
   }
 
-  // Save all daily rows (include StatID per row for unambiguous writes)
   async function saveDailyTable() {
     setDailyLoading(true);
     setDailyMessage(null);
     try {
-      const payload = dailyTable.map((r) => ({
-        StatID: r.statId || null,
-        Name: r.short_id,
-        Thursday: r.Thursday || "",
-        Friday: r.Friday || "",
-        Monday: r.Monday || "",
-        Tuesday: r.Tuesday || "",
-        Wednesday: r.Wednesday || "",
-        Quota: r.Quota || "",
-      }));
+      // Filter out calculated stats (is_calculated: true) since they shouldn't be saved
+      const payload = dailyTable
+        .filter((r) => !r.is_calculated)
+        .map((r) => ({
+          StatID: r.statId || null,
+          Name: r.short_id,
+          Thursday: r.Thursday || "",
+          Friday: r.Friday || "",
+          Monday: r.Monday || "",
+          Tuesday: r.Tuesday || "",
+          Wednesday: r.Wednesday || "",
+          Quota: r.Quota || "",
+        }));
       const res = await fetch(
         `${API}/services/save7R?thisWeek=${encodeURIComponent(dailyWeek)}`,
         {
@@ -611,69 +615,89 @@ export default function InputStats() {
                   <Table.Cell>{r.username}</Table.Cell>
                   <Table.Cell>{r.type}</Table.Cell>
                   <Table.Cell>
-                    <Input
-                      fluid
-                      value={r.Thursday || ""}
-                      onChange={(e) =>
-                        setDailyTable((prev) =>
-                          prev.map((x) =>
-                            x === r ? { ...x, Thursday: e.target.value } : x
+                    {r.is_calculated ? ( // <-- Conditional rendering
+                      <span>{r.Thursday || ""}</span> // Read-only: plain text
+                    ) : (
+                      <Input
+                        fluid
+                        value={r.Thursday || ""}
+                        onChange={(e) =>
+                          setDailyTable((prev) =>
+                            prev.map((x) =>
+                              x === r ? { ...x, Thursday: e.target.value } : x
+                            )
                           )
-                        )
-                      }
-                    />
+                        }
+                      />
+                    )}
                   </Table.Cell>
                   <Table.Cell>
-                    <Input
-                      fluid
-                      value={r.Friday || ""}
-                      onChange={(e) =>
-                        setDailyTable((prev) =>
-                          prev.map((x) =>
-                            x === r ? { ...x, Friday: e.target.value } : x
+                    {r.is_calculated ? (
+                      <span>{r.Friday || ""}</span>
+                    ) : (
+                      <Input
+                        fluid
+                        value={r.Friday || ""}
+                        onChange={(e) =>
+                          setDailyTable((prev) =>
+                            prev.map((x) =>
+                              x === r ? { ...x, Friday: e.target.value } : x
+                            )
                           )
-                        )
-                      }
-                    />
+                        }
+                      />
+                    )}
                   </Table.Cell>
                   <Table.Cell>
-                    <Input
-                      fluid
-                      value={r.Monday || ""}
-                      onChange={(e) =>
-                        setDailyTable((prev) =>
-                          prev.map((x) =>
-                            x === r ? { ...x, Monday: e.target.value } : x
+                    {r.is_calculated ? (
+                      <span>{r.Monday || ""}</span>
+                    ) : (
+                      <Input
+                        fluid
+                        value={r.Monday || ""}
+                        onChange={(e) =>
+                          setDailyTable((prev) =>
+                            prev.map((x) =>
+                              x === r ? { ...x, Monday: e.target.value } : x
+                            )
                           )
-                        )
-                      }
-                    />
+                        }
+                      />
+                    )}
                   </Table.Cell>
                   <Table.Cell>
-                    <Input
-                      fluid
-                      value={r.Tuesday || ""}
-                      onChange={(e) =>
-                        setDailyTable((prev) =>
-                          prev.map((x) =>
-                            x === r ? { ...x, Tuesday: e.target.value } : x
+                    {r.is_calculated ? (
+                      <span>{r.Tuesday || ""}</span>
+                    ) : (
+                      <Input
+                        fluid
+                        value={r.Tuesday || ""}
+                        onChange={(e) =>
+                          setDailyTable((prev) =>
+                            prev.map((x) =>
+                              x === r ? { ...x, Tuesday: e.target.value } : x
+                            )
                           )
-                        )
-                      }
-                    />
+                        }
+                      />
+                    )}
                   </Table.Cell>
                   <Table.Cell>
-                    <Input
-                      fluid
-                      value={r.Wednesday || ""}
-                      onChange={(e) =>
-                        setDailyTable((prev) =>
-                          prev.map((x) =>
-                            x === r ? { ...x, Wednesday: e.target.value } : x
+                    {r.is_calculated ? (
+                      <span>{r.Wednesday || ""}</span>
+                    ) : (
+                      <Input
+                        fluid
+                        value={r.Wednesday || ""}
+                        onChange={(e) =>
+                          setDailyTable((prev) =>
+                            prev.map((x) =>
+                              x === r ? { ...x, Wednesday: e.target.value } : x
+                            )
                           )
-                        )
-                      }
-                    />
+                        }
+                      />
+                    )}
                   </Table.Cell>
                   <Table.Cell>{total.toFixed(2)}</Table.Cell>
                   {/* <Table.Cell>

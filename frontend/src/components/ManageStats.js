@@ -28,6 +28,8 @@ export default function ManageStats() {
   const [type, setType] = useState("personal");
   const [valueType, setValueType] = useState("number");
   const [reversed, setReversed] = useState(false);
+  const [isCalculated, setIsCalculated] = useState(false); // New: checkbox state
+  const [calculatedFrom, setCalculatedFrom] = useState([]); // New: array of dependent stat IDs
 
   // NOTE: single assigned user and single assigned division
   const [assignedUser, setAssignedUser] = useState(null);
@@ -119,6 +121,8 @@ export default function ManageStats() {
     setType("personal");
     setValueType("number");
     setReversed(false);
+    setIsCalculated(false); // Reset
+    setCalculatedFrom([]); // Reset
     setAssignedUser(null);
     setAssignedDiv(null);
   };
@@ -130,7 +134,12 @@ export default function ManageStats() {
     setType(stat.type || "personal");
     setValueType(stat.value_type || "number");
     setReversed(!!stat.reversed);
+    setIsCalculated(!!stat.is_calculated); // New
+    setCalculatedFrom(
+      Array.isArray(stat.calculated_from) ? stat.calculated_from : []
+    ); // New: assume API provides this
 
+    // Always set assignments from stat (for all stats, including calculated)
     // Prefer single user_id (new API). Fallback to first element of user_ids if present (legacy).
     const uid =
       stat.user_id ??
@@ -164,6 +173,14 @@ export default function ManageStats() {
       return;
     }
 
+    if (isCalculated && calculatedFrom.length === 0) {
+      showAlert(
+        "Validation",
+        "Calculated stats must have at least one dependent stat"
+      );
+      return;
+    }
+
     // Build payload and include optional fields when present.
     // For compatibility with existing backend handlers we still send arrays, but with single element.
     const payload = {
@@ -173,6 +190,8 @@ export default function ManageStats() {
       type,
       value_type: valueType,
       reversed: !!reversed,
+      is_calculated: isCalculated, // New
+      calculated_from: calculatedFrom, // New: array of IDs
       user_ids: assignedUser ? [assignedUser] : [],
       division_ids: assignedDiv ? [assignedDiv] : [],
     };
@@ -227,6 +246,17 @@ export default function ManageStats() {
     } catch {
       showAlert("Network Error", "Could not delete stat");
     }
+  };
+
+  // Helper: Map IDs to short_ids for display
+  const mapCalculatedFromNames = (ids) => {
+    if (!Array.isArray(ids) || !ids.length) return "—";
+    return ids
+      .map((id) => {
+        const s = stats.find((st) => st.id === id);
+        return s ? s.short_id : String(id);
+      })
+      .join(", ");
   };
 
   // map assigned display names safely (normalize id types to string)
@@ -347,9 +377,46 @@ export default function ManageStats() {
                   onChange={(_, { checked }) => setReversed(!!checked)}
                 />
               </Form.Field>
+
+              <Form.Field>
+                <label>Is Calculated</label>
+                <Checkbox
+                  toggle
+                  checked={isCalculated}
+                  onChange={(_, { checked }) => setIsCalculated(!!checked)} // Removed clearing of assignments
+                />
+                <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+                  Check to make this stat sum others (read-only in input).
+                </div>
+              </Form.Field>
             </Form.Group>
 
-            {/* Assign to a single User */}
+            {isCalculated && ( // New: Conditional dependents dropdown
+              <Form.Field required>
+                <label>Calculated From (Dependent Stats)</label>
+                <Dropdown
+                  placeholder="Select stats to sum"
+                  fluid
+                  multiple
+                  selection
+                  options={stats
+                    .filter((s) => s.id !== editId && !s.is_calculated) // Exclude self and other calculated stats
+                    .map((s) => ({
+                      key: s.id,
+                      text: `${s.short_id} - ${s.full_name}: ${s.username}`,
+                      value: s.id,
+                    }))}
+                  value={calculatedFrom}
+                  onChange={(_, { value }) => setCalculatedFrom(value)}
+                />
+                <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+                  Select stats this one sums (e.g., Extinguisher VSD + System
+                  VSD).
+                </div>
+              </Form.Field>
+            )}
+
+            {/* Assign to a single User - Always shown */}
             <Form.Field>
               <label>Assigned User</label>
               <Dropdown
@@ -366,7 +433,7 @@ export default function ManageStats() {
               </div>
             </Form.Field>
 
-            {/* Assign to a single Division */}
+            {/* Assign to a single Division - Always shown */}
             <Form.Field>
               <label>
                 Assigned Division{" "}
@@ -418,6 +485,8 @@ export default function ManageStats() {
                 <Table.HeaderCell>Type</Table.HeaderCell>
                 <Table.HeaderCell>Value Type</Table.HeaderCell>
                 <Table.HeaderCell>Reversed</Table.HeaderCell>
+                <Table.HeaderCell>Is Calculated</Table.HeaderCell> {/* New */}
+                <Table.HeaderCell>Depends On</Table.HeaderCell> {/* New */}
                 <Table.HeaderCell>Assigned To</Table.HeaderCell>
                 <Table.HeaderCell>Actions</Table.HeaderCell>
               </Table.Row>
@@ -432,6 +501,12 @@ export default function ManageStats() {
                   <Table.Cell>{s.type}</Table.Cell>
                   <Table.Cell>{s.value_type}</Table.Cell>
                   <Table.Cell>{s.reversed ? "Yes" : "No"}</Table.Cell>
+                  <Table.Cell>{s.is_calculated ? "Yes" : "No"}</Table.Cell>{" "}
+                  {/* New */}
+                  <Table.Cell>
+                    {mapCalculatedFromNames(s.calculated_from)}
+                  </Table.Cell>{" "}
+                  {/* New */}
                   <Table.Cell>{mapAssignedNames(s)}</Table.Cell>
                   <Table.Cell>
                     <Button

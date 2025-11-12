@@ -138,7 +138,8 @@ func ListAssignedStatsHandler(w http.ResponseWriter, r *http.Request) {
 			s.assigned_user_id,
 			u.username,
 			s.assigned_division_id,
-			d.name AS division_name
+			d.name AS division_name,
+			s.is_calculated
 		FROM stats s
 		LEFT JOIN users u ON s.assigned_user_id = u.id
 		LEFT JOIN divisions d ON s.assigned_division_id = d.id
@@ -151,18 +152,6 @@ func ListAssignedStatsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	type statOut struct {
-		ID               int     `json:"id"`
-		ShortID          string  `json:"short_id"`
-		FullName         string  `json:"full_name"`
-		Type             string  `json:"type"`
-		ValueType        string  `json:"value_type"`
-		Reversed         bool    `json:"reversed"`
-		AssignedUserID   *int    `json:"user_id,omitempty"`
-		AssignedUsername *string `json:"username,omitempty"`
-		AssignedDivision *int    `json:"division_id,omitempty"`
-		AssignedDivName  *string `json:"division_name,omitempty"`
-	}
 	out := []statOut{}
 	for rows.Next() {
 		var s statOut
@@ -171,7 +160,7 @@ func ListAssignedStatsHandler(w http.ResponseWriter, r *http.Request) {
 		var assignedDiv sqlNullInt64
 		var divName sqlNullString
 		if err := rows.Scan(&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
-			&assignedUID, &assignedUsername, &assignedDiv, &divName); err != nil {
+			&assignedUID, &assignedUsername, &assignedDiv, &divName, &s.IsCalculated); err != nil {
 			webFail("Failed to scan assigned stat row", w, err)
 			return
 		}
@@ -220,14 +209,14 @@ func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve stat identity and metadata (prefer stat_id)
 	var userName, nameLower, statType, valueType string
+	var isCalculated bool
 	id, err := strconv.Atoi(statIDStr)
 	if err != nil {
 		webFail("Invalid stat_id", w, err)
 		return
 	}
-	if err := DB.QueryRow(`SELECT s.short_id, s.type, u.username, s.value_type FROM stats s LEFT JOIN users u on s.assigned_user_id = u.id WHERE s.id = ? LIMIT 1`, id).Scan(&nameLower, &statType, &userName, &valueType); err != nil {
+	if err := DB.QueryRow(`SELECT s.short_id, s.type, u.username, s.value_type, s.is_calculated FROM stats s LEFT JOIN users u on s.assigned_user_id = u.id WHERE s.id = ? LIMIT 1`, id).Scan(&nameLower, &statType, &userName, &valueType, &isCalculated); err != nil {
 		if err == sql.ErrNoRows {
 			webFail("Stat not found", w, err)
 			return
@@ -237,7 +226,6 @@ func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
 	}
 	nameLower = strings.ToLower(nameLower)
 
-	// compute concrete dates (Thursday = thisWeek)
 	we, _ := time.Parse("2006-01-02", thisWeek)
 	dates := map[string]string{
 		"Thursday":  we.Format("2006-01-02"),
@@ -247,32 +235,76 @@ func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
 		"Wednesday": we.AddDate(0, 0, 6).Format("2006-01-02"),
 	}
 
-	// Prepare DailyStat response and format currency values if needed.
+	if isCalculated {
+		calculatedFrom := getCalculatedFrom(id)
+		var rowDaily = DailyStat{Name: strings.ToUpper(nameLower), Quota: ""}
+		for day, dateStr := range dates {
+			var total float64
+			for _, depID := range calculatedFrom {
+				var depValue sql.NullInt64
+				err := DB.QueryRow(`SELECT value FROM daily_stats WHERE stat_id=? AND date=? LIMIT 1`, depID, dateStr).Scan(&depValue)
+				if err != nil && err != sql.ErrNoRows {
+					webFail("Failed to query dependent stat", w, err)
+					return
+				}
+				if depValue.Valid {
+					switch valueType {
+					case "currency":
+						total += float64(depValue.Int64) / 100.0
+					case "number":
+						total += float64(depValue.Int64)
+					case "percentage":
+						total += float64(depValue.Int64) / 100.0
+					}
+				}
+			}
+			formatted := ""
+			switch valueType {
+			case "currency":
+				formatted = ToUSD(total).String()
+			case "number":
+				formatted = fmt.Sprintf("%.0f", total)
+			case "percentage":
+				formatted = fmt.Sprintf("%.2f", total)
+			}
+			switch day {
+			case "Thursday":
+				rowDaily.Thursday = formatted
+			case "Friday":
+				rowDaily.Friday = formatted
+			case "Monday":
+				rowDaily.Monday = formatted
+			case "Tuesday":
+				rowDaily.Tuesday = formatted
+			case "Wednesday":
+				rowDaily.Wednesday = formatted
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(rowDaily)
+		return
+	}
+
+	// Original logic for non-calculated stats (unchanged)
 	var rowDaily = DailyStat{
 		Name:  strings.ToUpper(nameLower),
 		Quota: "",
 	}
 
 	for day, dateStr := range dates {
-		// Query the stored integer value (assumed stored as integer; for currency it's cents)
 		var v sql.NullInt64
-		var err error
 		err = DB.QueryRow(`SELECT value FROM daily_stats WHERE stat_id=? AND date=? LIMIT 1`, statIDStr, dateStr).Scan(&v)
 		if err != nil && err != sql.ErrNoRows {
 			webFail("Failed to query daily_stats", w, err)
 			return
 		}
 		if !v.Valid {
-			// leave empty string for missing values
 			continue
 		}
 
-		// Format depending on value_type
 		switch valueType {
 		case "currency":
-			// v.Int64 is cents (stored as integer); convert to USD and string like "500.00"
 			usd := USD(v.Int64)
-			// USD.String uses cents -> formatted dollars with two decimals
 			formatted := usd.String()
 			switch day {
 			case "Thursday":
@@ -287,7 +319,6 @@ func handleGetDailyStats(w http.ResponseWriter, r *http.Request) {
 				rowDaily.Wednesday = formatted
 			}
 		default:
-			// For number/percentage (or unknown), return plain integer string
 			s := fmt.Sprintf("%d", v.Int64)
 			switch day {
 			case "Thursday":
@@ -330,7 +361,6 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decode incoming JSON; expect array of objects each with a required StatID
 	var rawRows []map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&rawRows); err != nil {
 		webFail("Failed to decode body", w, err)
@@ -396,12 +426,10 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, rw)
 	}
 
-	// Validate rows using existing validateDailyStats (or your improved validator)
-	// After decoding rows into []Row (where Row.StatID is required), validate using stat metadata:
 	for _, v := range rows {
-		// resolve stat metadata by id (no fallback)
 		var shortID, valueType, statType string
-		err := DB.QueryRow(`SELECT short_id, value_type, type FROM stats WHERE id = ? LIMIT 1`, v.StatID).Scan(&shortID, &valueType, &statType)
+		var isCalculated bool
+		err := DB.QueryRow(`SELECT short_id, value_type, type, is_calculated FROM stats WHERE id = ? LIMIT 1`, v.StatID).Scan(&shortID, &valueType, &statType, &isCalculated)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				webFail(fmt.Sprintf("Stat not found for StatID %d", v.StatID), w, err)
@@ -411,7 +439,11 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// build DailyStat for validation
+		if isCalculated {
+			webFail(fmt.Sprintf("Cannot save calculated stat %s (id=%d)", shortID, v.StatID), w, errors.New("calculated stat"))
+			return
+		}
+
 		ds := DailyStat{
 			Name:      shortID,
 			Thursday:  v.Thursday,
@@ -426,7 +458,6 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 			webFail("Validation failed for daily stat", w, err)
 			return
 		}
-	
 	}
 
 	tx, err := DB.Begin()
@@ -445,10 +476,8 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, row := range rows {
-		// Resolve stat by ID (no fallback)
 		var shortID string
-		var statType string
-		if err := DB.QueryRow(`SELECT short_id, type FROM stats WHERE id = ? LIMIT 1`, row.StatID).Scan(&shortID, &statType); err != nil {
+		if err := DB.QueryRow(`SELECT short_id FROM stats WHERE id = ? LIMIT 1`, row.StatID).Scan(&shortID); err != nil {
 			if err == sql.ErrNoRows {
 				tx.Rollback()
 				webFail(fmt.Sprintf("Stat not found for StatID %d", row.StatID), w, err)
@@ -459,17 +488,9 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Only support personal writes via this endpoint. Reject divisional/main writes here.
-		// if statType != "personal" {
-		// 	tx.Rollback()
-		// 	webFail(fmt.Sprintf("Stat %s (id=%d) is not a personal stat and cannot be written via this endpoint", shortID, row.StatID), w, errors.New("invalid stat scope"))
-		// 	return
-		// }
-
-		// Delete existing rows for this user and stat name for the week
 		if _, err := tx.Exec(`DELETE FROM daily_stats WHERE stat_id=? AND date IN (?,?,?,?,?)`, row.StatID, dates["Thursday"], dates["Friday"], dates["Monday"], dates["Tuesday"], dates["Wednesday"]); err != nil {
 			tx.Rollback()
-			webFail("Failed to clear existing personal daily rows", w, err)
+			webFail("Failed to clear existing daily rows", w, err)
 			return
 		}
 
@@ -500,7 +521,7 @@ func handleSave7R(w http.ResponseWriter, r *http.Request) {
 			dateStr := dates[day]
 			if _, err := tx.Exec(`INSERT INTO daily_stats (stat_id, date, value) VALUES (?, ?, ?)`, row.StatID, dateStr, valueInt); err != nil {
 				tx.Rollback()
-				webFail("Failed to insert personal daily row", w, err)
+				webFail("Failed to insert daily row", w, err)
 				return
 			}
 		}
@@ -614,30 +635,34 @@ func CreateStatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ShortID     string `json:"short_id"`
-		FullName    string `json:"full_name"`
-		Type        string `json:"type"`
-		ValueType   string `json:"value_type"`
-		Reversed    bool   `json:"reversed"`
-		UserIDs     []int  `json:"user_ids"`     // compatibility: we accept array but use the first element
-		DivisionIDs []int  `json:"division_ids"` // compatibility: accept array, use first
+		ShortID        string `json:"short_id"`
+		FullName       string `json:"full_name"`
+		Type           string `json:"type"`
+		ValueType      string `json:"value_type"`
+		Reversed       bool   `json:"reversed"`
+		UserIDs        []int  `json:"user_ids"`
+		DivisionIDs    []int  `json:"division_ids"`
+		IsCalculated   bool   `json:"is_calculated"`
+		CalculatedFrom []int  `json:"calculated_from"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		webFail("Invalid JSON payload", w, err)
 		return
 	}
 
-	// Validation
-	if strings.TrimSpace(req.ShortID) == "" {
-		webFail("Short ID is required", w, nil)
-		return
-	}
-	if strings.TrimSpace(req.FullName) == "" {
-		webFail("Full Name is required", w, nil)
+	if strings.TrimSpace(req.ShortID) == "" || strings.TrimSpace(req.FullName) == "" {
+		webFail("Short ID and Full Name are required", w, nil)
 		return
 	}
 	req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
 	req.FullName = strings.TrimSpace(req.FullName)
+
+	if req.IsCalculated {
+		if len(req.CalculatedFrom) == 0 {
+			webFail("Calculated stats must have calculated_from dependencies", w, nil)
+			return
+		}
+	}
 
 	tx, err := DB.Begin()
 	if err != nil {
@@ -646,12 +671,10 @@ func CreateStatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := tx.Exec(`
-		INSERT INTO stats (short_id, full_name, type, value_type, reversed, assigned_user_id, assigned_division_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO stats (short_id, full_name, type, value_type, reversed, assigned_user_id, assigned_division_id, is_calculated)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed,
-		nullIntPtr(req.UserIDs),
-		nullIntPtr(req.DivisionIDs),
-	)
+		nullIntPtr(req.UserIDs), nullIntPtr(req.DivisionIDs), req.IsCalculated)
 	if err != nil {
 		tx.Rollback()
 		webFail("Failed to insert stat", w, err)
@@ -664,13 +687,20 @@ func CreateStatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Keep compatibility: populate stat_user_assignments / stat_division_assignments
-	for _, uid := range req.UserIDs {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`, statID, uid); err != nil {
-			tx.Rollback()
-			webFail("Failed to populate stat_user_assignments", w, err)
-			return
+	if req.IsCalculated && len(req.CalculatedFrom) > 0 {
+		for _, depID := range req.CalculatedFrom {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_calculations (stat_id, dependent_stat_id) VALUES (?, ?)`, statID, depID); err != nil {
+				tx.Rollback()
+				webFail("Failed to insert stat_calculation", w, err)
+				return
+			}
 		}
+	}
+
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_user_assignments (stat_id, user_id) VALUES (?, ?)`, statID, nullIntPtr(req.UserIDs)); err != nil {
+		tx.Rollback()
+		webFail("Failed to populate stat_user_assignments", w, err)
+		return
 	}
 	for _, did := range req.DivisionIDs {
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_division_assignments (stat_id, division_id) VALUES (?, ?)`, statID, did); err != nil {
@@ -713,13 +743,15 @@ func UpdateStatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ShortID     string `json:"short_id"`
-		FullName    string `json:"full_name"`
-		Type        string `json:"type"`
-		ValueType   string `json:"value_type"`
-		Reversed    bool   `json:"reversed"`
-		UserIDs     []int  `json:"user_ids"`
-		DivisionIDs []int  `json:"division_ids"`
+		ShortID        string `json:"short_id"`
+		FullName       string `json:"full_name"`
+		Type           string `json:"type"`
+		ValueType      string `json:"value_type"`
+		Reversed       bool   `json:"reversed"`
+		UserIDs        []int  `json:"user_ids"`
+		DivisionIDs    []int  `json:"division_ids"`
+		IsCalculated   bool   `json:"is_calculated"`
+		CalculatedFrom []int  `json:"calculated_from"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		webFail("Invalid JSON payload", w, err)
@@ -733,22 +765,41 @@ func UpdateStatHandler(w http.ResponseWriter, r *http.Request) {
 	req.ShortID = strings.ToUpper(strings.TrimSpace(req.ShortID))
 	req.FullName = strings.TrimSpace(req.FullName)
 
+	if req.IsCalculated {
+		if len(req.CalculatedFrom) == 0 {
+			webFail("Calculated stats must have calculated_from dependencies", w, nil)
+			return
+		}
+	}
+
 	tx, err := DB.Begin()
 	if err != nil {
 		webFail("Failed to start transaction", w, err)
 		return
 	}
 
-	_, err = tx.Exec(`UPDATE stats SET short_id=?, full_name=?, type=?, value_type=?, reversed=?, assigned_user_id=?, assigned_division_id=? WHERE id = ?`,
+	_, err = tx.Exec(`UPDATE stats SET short_id=?, full_name=?, type=?, value_type=?, reversed=?, assigned_user_id=?, assigned_division_id=?, is_calculated=? WHERE id = ?`,
 		req.ShortID, req.FullName, req.Type, req.ValueType, req.Reversed,
-		nullIntPtr(req.UserIDs), nullIntPtr(req.DivisionIDs), id)
+		nullIntPtr(req.UserIDs), nullIntPtr(req.DivisionIDs), req.IsCalculated, id)
 	if err != nil {
 		tx.Rollback()
 		webFail("Failed to update stat", w, err)
 		return
 	}
 
-	// Rebuild assignment tables for compatibility
+	if _, err := tx.Exec(`DELETE FROM stat_calculations WHERE stat_id = ?`, id); err != nil {
+		tx.Rollback()
+		webFail("Failed to clear stat_calculations", w, err)
+		return
+	}
+	for _, depID := range req.CalculatedFrom {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO stat_calculations (stat_id, dependent_stat_id) VALUES (?, ?)`, id, depID); err != nil {
+			tx.Rollback()
+			webFail("Failed to insert stat_calculation", w, err)
+			return
+		}
+	}
+
 	if _, err := tx.Exec(`DELETE FROM stat_user_assignments WHERE stat_id = ?`, id); err != nil {
 		tx.Rollback()
 		webFail("Failed to clear stat_user_assignments", w, err)
@@ -816,7 +867,8 @@ func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
 			s.assigned_user_id,
 			u.username,
 			s.assigned_division_id,
-			d.name AS division_name
+			d.name AS division_name,
+			s.is_calculated
 		FROM stats s
 		LEFT JOIN users u ON s.assigned_user_id = u.id
 		LEFT JOIN divisions d ON s.assigned_division_id = d.id
@@ -828,18 +880,6 @@ func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	type statOut struct {
-		ID                int     `json:"id"`
-		ShortID           string  `json:"short_id"`
-		FullName          string  `json:"full_name"`
-		Type              string  `json:"type"`
-		ValueType         string  `json:"value_type"`
-		Reversed          bool    `json:"reversed"`
-		AssignedUserID    *int    `json:"user_id,omitempty"`
-		AssignedUsername  *string `json:"username,omitempty"`
-		AssignedDivision  *int    `json:"division_id,omitempty"`
-		AssignedDivName   *string `json:"division_name,omitempty"`
-	}
 	out := []statOut{}
 	for rows.Next() {
 		var s statOut
@@ -848,7 +888,7 @@ func ListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
 		var assignedDiv sqlNullInt64
 		var divName sqlNullString
 		if err := rows.Scan(&s.ID, &s.ShortID, &s.FullName, &s.Type, &s.ValueType, &s.Reversed,
-			&assignedUID, &assignedUsername, &assignedDiv, &divName); err != nil {
+			&assignedUID, &assignedUsername, &assignedDiv, &divName, &s.IsCalculated); err != nil {
 			webFail("Failed to scan stat row", w, err)
 			return
 		}
@@ -934,11 +974,11 @@ func ChangePasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
+	var reqPass struct {
 		OldPassword string `json:"old_password"`
 		NewPassword string `json:"new_password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&reqPass); err != nil {
 		log.Printf("Invalid change password request: %v", err)
 		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
 		return
@@ -954,13 +994,13 @@ func ChangePasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.OldPassword)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(reqPass.OldPassword)); err != nil {
 		log.Printf("Invalid old password for user %d", userID)
 		http.Error(w, `{"message": "Invalid old password"}`, http.StatusUnauthorized)
 		return
 	}
 
-	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	newHash, err := bcrypt.GenerateFromPassword([]byte(reqPass.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		log.Printf("Error hashing new password: %v", err)
 		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
@@ -986,11 +1026,11 @@ func ResetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
+	var reqPass struct {
 		UserID      int    `json:"user_id"`
 		NewPassword string `json:"new_password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&reqPass); err != nil {
 		log.Printf("Invalid reset password request: %v", err)
 		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
 		return
@@ -998,28 +1038,28 @@ func ResetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 
 	companyID := r.Context().Value("company_id").(string)
     var userCompanyID string
-    err := DB.QueryRow("SELECT c.company_id FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", req.UserID).Scan(&userCompanyID)
+    err := DB.QueryRow("SELECT c.company_id FROM users u JOIN companies c ON u.company_id = c.id WHERE u.id = ?", reqPass.UserID).Scan(&userCompanyID)
     if err != nil || userCompanyID != companyID {
-        log.Printf("User %d not found or not in company %s: %v", req.UserID, companyID, err)
+        log.Printf("User %d not found or not in company %s: %v", reqPass.UserID, companyID, err)
         http.Error(w, `{"message": "User not found"}`, http.StatusNotFound)
         return
     }
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(reqPass.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		log.Printf("Error hashing password: %v", err)
 		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
 		return
 	}
 
-	_, err = DB.Exec("UPDATE users SET password_hash = ? WHERE id = ?", string(hash), req.UserID)
+	_, err = DB.Exec("UPDATE users SET password_hash = ? WHERE id = ?", string(hash), reqPass.UserID)
 	if err != nil {
-		log.Printf("Error updating password for user %d: %v", req.UserID, err)
+		log.Printf("Error updating password for user %d: %v", reqPass.UserID, err)
 		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("Password reset for user %d in company %s", req.UserID, companyID)
+	log.Printf("Password reset for user %d in company %s", reqPass.UserID, companyID)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"message": "Password reset successful"}`)
 }
@@ -1069,17 +1109,17 @@ func UpdateUserRoleHandler(w http.ResponseWriter, r *http.Request) {
 	userID := vars["id"]
 	
 
-	var req struct {
+	var reqRole struct {
 		Role string `json:"role"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&reqRole); err != nil {
 		log.Printf("Invalid update role request: %v", err)
 		http.Error(w, `{"message": "Invalid request"}`, http.StatusBadRequest)
 		return
 	}
 
-	if req.Role != "user" && req.Role != "admin" {
-		log.Printf("Invalid role: %s", req.Role)
+	if reqRole.Role != "user" && reqRole.Role != "admin" {
+		log.Printf("Invalid role: %s", reqRole.Role)
 		http.Error(w, `{"message": "Invalid role"}`, http.StatusBadRequest)
 		return
 	}
@@ -1101,14 +1141,14 @@ func UpdateUserRoleHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-	_, err = DB.Exec("UPDATE users SET role = ? WHERE id = ?", req.Role, userID)
+	_, err = DB.Exec("UPDATE users SET role = ? WHERE id = ?", reqRole.Role, userID)
 	if err != nil {
 		log.Printf("Error updating role for user %s: %v", userID, err)
 		http.Error(w, `{"message": "Server error"}`, http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("Updated role for user %s to %s in company %s", userID, req.Role, companyID)
+	log.Printf("Updated role for user %s to %s in company %s", userID, reqRole.Role, companyID)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"message": "Role updated successfully"}`)
 }
@@ -2338,18 +2378,6 @@ func PublicListAllStatsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	type statOut struct {
-		ID                int     `json:"id"`
-		ShortID           string  `json:"short_id"`
-		FullName          string  `json:"full_name"`
-		Type              string  `json:"type"`
-		ValueType         string  `json:"value_type"`
-		Reversed          bool    `json:"reversed"`
-		AssignedUserID    *int    `json:"user_id,omitempty"`
-		AssignedUsername  *string `json:"username,omitempty"`
-		AssignedDivision  *int    `json:"division_id,omitempty"`
-		AssignedDivName   *string `json:"division_name,omitempty"`
-	}
 	out := []statOut{}
 	for rows.Next() {
 		var s statOut
@@ -2480,4 +2508,46 @@ func PublicGetStatSeriesHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+func getCalculatedFrom(statID int) []int {
+	rows, err := DB.Query(`SELECT dependent_stat_id FROM stat_calculations WHERE stat_id = ? ORDER BY dependent_stat_id`, statID)
+	if err != nil {
+		return []int{}
+	}
+	defer rows.Close()
+	var deps []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err == nil {
+			deps = append(deps, id)
+		}
+	}
+	return deps
+}
+
+type statOut struct {
+	ID               int    `json:"id"`
+	ShortID          string `json:"short_id"`
+	FullName         string `json:"full_name"`
+	Type             string `json:"type"`
+	ValueType        string `json:"value_type"`
+	Reversed         bool   `json:"reversed"`
+	AssignedUserID   *int   `json:"user_id,omitempty"`
+	AssignedUsername *string `json:"username,omitempty"`
+	AssignedDivision *int   `json:"division_id,omitempty"`
+	AssignedDivName  *string `json:"division_name,omitempty"`
+	IsCalculated     bool   `json:"is_calculated"`
+}
+
+var req struct {
+	ShortID        string `json:"short_id"`
+	FullName       string `json:"full_name"`
+	Type           string `json:"type"`
+	ValueType      string `json:"value_type"`
+	Reversed       bool   `json:"reversed"`
+	UserIDs        []int  `json:"user_ids"`
+	DivisionIDs    []int  `json:"division_ids"`
+	IsCalculated   bool   `json:"is_calculated"`
+	CalculatedFrom []int  `json:"calculated_from"`  // Still accept in payload for creation
 }
