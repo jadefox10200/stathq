@@ -561,6 +561,7 @@ func main() {
 
 	// services endpoints - use DB-backed handlers
 	router.Handle("/services/getWeeklyStats", AuthMiddleware("", http.HandlerFunc(handleGetWeeklyStats)))
+	router.Handle("/services/getStatsData", AuthMiddleware("", http.HandlerFunc(handleGetStatsData)))
 	router.Handle("/services/getDailyStats", AuthMiddleware("", http.HandlerFunc(handleGetDailyStats)))
 	router.Handle("/services/save7R", AuthMiddleware("", http.HandlerFunc(handleSave7R)))
 	router.Handle("/services/saveWeeklyEdit", AuthMiddleware("", http.HandlerFunc(handleSaveWeeklyEdit)))
@@ -2550,4 +2551,210 @@ var req struct {
 	DivisionIDs    []int  `json:"division_ids"`
 	IsCalculated   bool   `json:"is_calculated"`
 	CalculatedFrom []int  `json:"calculated_from"`  // Still accept in payload for creation
+}
+
+// Add this helper (place near other helpers)
+func convertStoredIntToFloat(v int64, valueType string) float64 {
+	switch valueType {
+	case "currency":
+		return float64(v) / 100.0
+	case "number":
+		return float64(v)
+	case "percentage":
+		return float64(v) / 100.0
+	default:
+		return float64(v)
+	}
+}
+
+// Replace existing handleGetWeeklyStats with this implementation.
+func handleGetStatsData(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	// required stat_id
+	statIDStr := q.Get("stat_id")
+	if statIDStr == "" {
+		webFail("stat_id is required", w, errors.New("missing stat_id"))
+		return
+	}
+	statID, err := strconv.Atoi(statIDStr)
+	if err != nil {
+		webFail("Invalid stat_id", w, err)
+		return
+	}
+
+	// optional params
+	view := strings.ToLower(q.Get("view"))
+	if view == "" {
+		view = "weekly"
+	}
+	if view != "weekly" && view != "monthly" && view != "yearly" {
+		webFail("Invalid view (use weekly|monthly|yearly)", w, fmt.Errorf("invalid view=%s", view))
+		return
+	}
+
+	// allowed limits; default 12
+	limit := 12
+	if l := q.Get("limit"); l != "" {
+		if li, err := strconv.Atoi(l); err == nil {
+			switch li {
+			case 6, 12, 24, 36, 52:
+				limit = li
+			default:
+				limit = 12
+			}
+		}
+	}
+
+	endParam := q.Get("end") // end week date
+	// Resolve endWeek: if empty, try latest week_ending for stat
+	var endWeek string
+	if endParam != "" {
+		// validate: must be a Thursday
+		if err := checkIfValidWE(endParam); err != nil {
+			webFail("Invalid end week (must be Thursday YYYY-MM-DD)", w, err)
+			return
+		}
+		endWeek = endParam
+	} else {
+		// query latest week_ending for this stat
+		err := DB.QueryRow(`SELECT MAX(week_ending) FROM weekly_stats WHERE stat_id = ?`, statID).Scan(&endWeek)
+		if err != nil && err != sql.ErrNoRows {
+			webFail("Failed to query latest week_ending", w, err)
+			return
+		}
+		if endWeek == "" {
+			// fallback to current week's Thursday
+			nowUTC := time.Now().UTC()
+			dow := int(nowUTC.Weekday()) // 0=Sun..6=Sat
+			daysUntilThu := (4 - dow + 7) % 7
+			thu := nowUTC.AddDate(0, 0, daysUntilThu)
+			endWeek = thu.Format("2006-01-02")
+		}
+	}
+
+	// Get value_type to convert integer sums to floats
+	var valueType string
+	if err := DB.QueryRow(`SELECT value_type FROM stats WHERE id = ? LIMIT 1`, statID).Scan(&valueType); err != nil {
+		if err == sql.ErrNoRows {
+			webFail("Stat not found", w, err)
+			return
+		}
+		webFail("Failed to query stat metadata", w, err)
+		return
+	}
+
+	// Response shape: []{ Weekending: string, Value: float64 }
+	type outRow struct {
+		Weekending string  `json:"Weekending"`
+		Value      float64 `json:"Value"`
+	}
+
+	out := []outRow{}
+
+	switch view {
+	case "weekly":
+		// Select weekly rows up to endWeek, ordered descending, limited, then reverse to ascending
+		rows, err := DB.Query(`
+			SELECT week_ending, value
+			FROM weekly_stats
+			WHERE stat_id = ? AND week_ending <= ?
+			ORDER BY week_ending DESC
+			LIMIT ?
+		`, statID, endWeek, limit)
+		if err != nil {
+			webFail("Failed to query weekly stats", w, err)
+			return
+		}
+		defer rows.Close()
+
+		tmp := []outRow{}
+		for rows.Next() {
+			var we string
+			var v sql.NullInt64
+			if err := rows.Scan(&we, &v); err != nil {
+				webFail("Failed to scan weekly row", w, err)
+				return
+			}
+			if !v.Valid {
+				continue
+			}
+			val := convertStoredIntToFloat(v.Int64, valueType)
+			tmp = append(tmp, outRow{Weekending: we, Value: val})
+		}
+		// Reverse to ascending
+		for i := len(tmp) - 1; i >= 0; i-- {
+			out = append(out, tmp[i])
+		}
+
+	case "monthly":
+		// Group by month (YYYY-MM)
+		rows, err := DB.Query(`
+			SELECT strftime('%Y-%m', week_ending) as period, SUM(value) as total
+			FROM weekly_stats
+			WHERE stat_id = ? AND week_ending <= ?
+			GROUP BY period
+			ORDER BY period DESC
+			LIMIT ?
+		`, statID, endWeek, limit)
+		if err != nil {
+			webFail("Failed to query monthly stats", w, err)
+			return
+		}
+		defer rows.Close()
+
+		tmp := []outRow{}
+		for rows.Next() {
+			var period string
+			var total sql.NullInt64
+			if err := rows.Scan(&period, &total); err != nil {
+				webFail("Failed to scan monthly row", w, err)
+				return
+			}
+			if !total.Valid {
+				continue
+			}
+			val := convertStoredIntToFloat(total.Int64, valueType)
+			tmp = append(tmp, outRow{Weekending: period, Value: val})
+		}
+		for i := len(tmp) - 1; i >= 0; i-- {
+			out = append(out, tmp[i])
+		}
+
+	case "yearly":
+		rows, err := DB.Query(`
+			SELECT strftime('%Y', week_ending) as period, SUM(value) as total
+			FROM weekly_stats
+			WHERE stat_id = ? AND week_ending <= ?
+			GROUP BY period
+			ORDER BY period DESC
+			LIMIT ?
+		`, statID, endWeek, limit)
+		if err != nil {
+			webFail("Failed to query yearly stats", w, err)
+			return
+		}
+		defer rows.Close()
+
+		tmp := []outRow{}
+		for rows.Next() {
+			var period string
+			var total sql.NullInt64
+			if err := rows.Scan(&period, &total); err != nil {
+				webFail("Failed to scan yearly row", w, err)
+				return
+			}
+			if !total.Valid {
+				continue
+			}
+			val := convertStoredIntToFloat(total.Int64, valueType)
+			tmp = append(tmp, outRow{Weekending: period, Value: val})
+		}
+		for i := len(tmp) - 1; i >= 0; i-- {
+			out = append(out, tmp[i])
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }

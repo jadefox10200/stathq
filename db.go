@@ -129,7 +129,7 @@ func InitDB() {
 
 	-- Enforce a single canonical row per (stat_id, week_ending)
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_weekly_stat_week ON weekly_stats(stat_id, week_ending);
-
+	CREATE INDEX IF NOT EXISTS idx_weekly_stat_week ON weekly_stats(stat_id, week_ending);
 	`)
 	if err != nil {
 		log.Fatalf("failed to create tables: %v", err)
