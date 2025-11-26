@@ -5,6 +5,7 @@ import {
   Line,
   XAxis,
   YAxis,
+  Tooltip,
   CartesianGrid,
   LabelList,
 } from "recharts";
@@ -118,9 +119,13 @@ export default function ChartLine({
               dataKey={xKey}
               type="category"
               allowDuplicatedCategory={false}
+              sclaeToFit="true"
+              verticalAnchor="start"
+              interval={0}
+              angle="-40"
             />
             <YAxis reversed={reversed} />
-            {/* <Tooltip formatter={(v) => valueFormatter(Number(v))} /> */}
+            <Tooltip formatter={(v) => valueFormatter(Number(v))} />
             <Line
               type="linear"
               dataKey={yKey}
@@ -146,17 +151,22 @@ export default function ChartLine({
       <ResponsiveContainer>
         <LineChart
           data={data}
-          margin={{ top: 20, right: 30, left: 20, bottom: 5 }}
+          margin={{ top: 20, right: 30, left: 20, bottom: 35 }}
         >
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis
             dataKey={xKey}
             type="category"
             allowDuplicatedCategory={false}
-            interval="preserveStartEnd"
+            // interval="preserveStartEnd"
+            sclaeToFit="true"
+            verticalAnchor="start"
+            interval={0}
+            angle="-40"
+            textAnchor="end"
           />
           <YAxis reversed={reversed} />
-          {/* <Tooltip formatter={(v) => valueFormatter(Number(v))} /> */}
+          <Tooltip formatter={(v) => valueFormatter(Number(v))} />
           {/* Render each segment as a separate Line */}
           {data.slice(0, -1).map((_, i) => (
             <Line
