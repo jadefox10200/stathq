@@ -5,7 +5,6 @@ import {
   Line,
   XAxis,
   YAxis,
-  Tooltip,
   CartesianGrid,
   LabelList,
 } from "recharts";
@@ -125,7 +124,7 @@ export default function ChartLine({
               angle="-40"
             />
             <YAxis reversed={reversed} />
-            <Tooltip formatter={(v) => valueFormatter(Number(v))} />
+            {/* <Tooltip formatter={(v) => valueFormatter(Number(v))} /> */}
             <Line
               type="linear"
               dataKey={yKey}
@@ -166,7 +165,7 @@ export default function ChartLine({
             textAnchor="end"
           />
           <YAxis reversed={reversed} />
-          <Tooltip formatter={(v) => valueFormatter(Number(v))} />
+          {/* <Tooltip formatter={(v) => valueFormatter(Number(v))} /> */}
           {/* Render each segment as a separate Line */}
           {data.slice(0, -1).map((_, i) => (
             <Line
