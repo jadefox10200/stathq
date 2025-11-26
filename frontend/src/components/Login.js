@@ -12,12 +12,16 @@ export default function Login() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
-
     try {
+      const normalizedUsername = username.trim().toLowerCase();
       const response = await fetch(`${process.env.REACT_APP_API_URL}/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ company_id: companyID, username, password }),
+        body: JSON.stringify({
+          company_id: companyID,
+          username: normalizedUsername,
+          password,
+        }),
         credentials: "include",
       });
 

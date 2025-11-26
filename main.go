@@ -1176,6 +1176,8 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	creds.Username = strings.ToLower(strings.TrimSpace(creds.Username))
+
 	// Fetch user
 	var userID int
 	var hash, role string
@@ -1183,7 +1185,7 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		SELECT u.id, u.password_hash, u.role
 		FROM users u
 		JOIN companies c ON u.company_id = c.id
-		WHERE c.company_id = ? AND u.username = ?
+		WHERE c.company_id = ? AND lower(u.username) = ?
 	`, creds.CompanyID, creds.Username).Scan(&userID, &hash, &role)
 	if err != nil {
 		log.Printf("Invalid credentials for %s/%s: %v", creds.CompanyID, creds.Username, err)

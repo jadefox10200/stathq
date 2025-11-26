@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
@@ -169,6 +170,8 @@ func RegisterCompany(companyID, companyName, adminUsername, adminPassword string
 		return fmt.Errorf("failed to hash password: %v", err)
 	}
 
+	adminUsername = strings.ToLower(strings.TrimSpace(adminUsername))
+	
 	// Insert admin user
 	_, err = tx.Exec(`
 		INSERT INTO users (company_id, username, password_hash, role)
@@ -203,6 +206,7 @@ func RegisterUser(companyID, username, password, role string) error {
 	}
 
 	// Insert user
+	username = strings.ToLower(strings.TrimSpace(username))
 	_, err = DB.Exec(`
 		INSERT INTO users (company_id, username, password_hash, role)
 		VALUES (?, ?, ?, ?)
