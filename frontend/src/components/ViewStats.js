@@ -183,7 +183,9 @@ export default function ViewStats() {
     // For "all", no filter
     return filteredStats.map((s) => ({
       key: s.id,
-      text: `${s.short_id} — ${s.full_name} (${s.type || "personal"})`,
+      text: `${s.short_id} — ${s.full_name} (${s.type || "personal"}) ${
+        s.username ? `: ${s.username}` : ""
+      }`,
       value: s.id,
     }));
   }, [stats, filterType, selectedDivision, selectedUser]);

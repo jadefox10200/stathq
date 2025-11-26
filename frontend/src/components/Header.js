@@ -60,7 +60,7 @@ export default function Header() {
           to="/viewStats"
           className={({ isActive }) => `item ${isActive ? "active" : ""}`}
         >
-          View Weekly Stats
+          View Stats
         </NavLink>
         {isAdmin && (
           <NavLink
