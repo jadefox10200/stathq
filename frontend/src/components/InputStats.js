@@ -1,13 +1,8 @@
-// Updated InputStats.js — small UX change so the weekly "Enter Value" modal
-// uses the currently selected week (weeklyWeek) and no longer asks the user
-// to pick the week again inside the modal.
-//
-// Replace your existing frontend/src/pages/InputStats.js with this file or
-// merge the small changes shown below (openWeeklyModal and the Weekly modal JSX).
-//
-// Note: other functions remain the same as in the aiFix version; this file
-// is the full component with only the modal/week behavior adjusted.
-
+// NOTE: This is the updated InputStats.js with the change so "Save Weekly"
+// is available for every row (including is_calculated). It also updates the
+// helper that opens the weekly modal from a daily row to prefer the existing
+// canonical weekly value (weeklyValues[statId]) when present and fall back to
+// the computed cumulative daily total otherwise.
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Container,
@@ -131,6 +126,9 @@ export default function InputStats() {
   const [historyList, setHistoryList] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
+  // track per-row weekly-saving state (array of statIds currently saving weekly)
+  const [savingWeeklyIds, setSavingWeeklyIds] = useState([]);
+
   // load user + assigned stats
   useEffect(() => {
     (async () => {
@@ -205,13 +203,14 @@ export default function InputStats() {
             username: s.username,
             full_name: s.full_name,
             type: s.type,
-            is_calculated: s.is_calculated, // <-- Add this
+            is_calculated: s.is_calculated,
             Thursday: "",
             Friday: "",
             Monday: "",
             Tuesday: "",
             Wednesday: "",
             Quota: "",
+            dirty: false, // track changes
           });
           continue;
         }
@@ -222,13 +221,14 @@ export default function InputStats() {
           username: s.username,
           full_name: s.full_name,
           type: s.type,
-          is_calculated: s.is_calculated, // <-- Add this
+          is_calculated: s.is_calculated,
           Thursday: json.Thursday || "",
           Friday: json.Friday || "",
           Monday: json.Monday || "",
           Tuesday: json.Tuesday || "",
           Wednesday: json.Wednesday || "",
           Quota: json.Quota || "",
+          dirty: false, // track changes
         });
       }
       setDailyTable(rows);
@@ -244,19 +244,24 @@ export default function InputStats() {
     setDailyLoading(true);
     setDailyMessage(null);
     try {
-      // Filter out calculated stats (is_calculated: true) since they shouldn't be saved
-      const payload = dailyTable
-        .filter((r) => !r.is_calculated)
-        .map((r) => ({
-          StatID: r.statId || null,
-          Name: r.short_id,
-          Thursday: r.Thursday || "",
-          Friday: r.Friday || "",
-          Monday: r.Monday || "",
-          Tuesday: r.Tuesday || "",
-          Wednesday: r.Wednesday || "",
-          Quota: r.Quota || "",
-        }));
+      // Only send rows that have been modified (dirty) and are not calculated
+      const modified = dailyTable.filter((r) => r.dirty && !r.is_calculated);
+      if (modified.length === 0) {
+        setDailyMessage({ type: "info", text: "No modified rows to save" });
+        return;
+      }
+
+      const payload = modified.map((r) => ({
+        StatID: r.statId || null,
+        Name: r.short_id,
+        Thursday: r.Thursday || "",
+        Friday: r.Friday || "",
+        Monday: r.Monday || "",
+        Tuesday: r.Tuesday || "",
+        Wednesday: r.Wednesday || "",
+        Quota: r.Quota || "",
+      }));
+
       const res = await fetch(
         `${API}/services/save7R?thisWeek=${encodeURIComponent(dailyWeek)}`,
         {
@@ -269,10 +274,215 @@ export default function InputStats() {
       const txt = await res.text();
       if (res.ok) {
         setDailyMessage({ type: "success", text: txt || "Saved" });
+        // Refresh the table so we don't overwrite others' changes; this resets dirty flags
         await loadDailyTable(dailyWeek, statsMeta);
       } else {
         setDailyMessage({ type: "error", text: txt || "Failed to save" });
       }
+    } catch (err) {
+      setDailyMessage({ type: "error", text: String(err) });
+    } finally {
+      setDailyLoading(false);
+    }
+  }
+
+  // Save a single row (per-line save). Sends only that stat and then refreshes that row
+  async function saveDailyRow(row) {
+    if (!row || row.is_calculated) return;
+    setDailyLoading(true);
+    setDailyMessage(null);
+    try {
+      const payload = [
+        {
+          StatID: row.statId || null,
+          Name: row.short_id,
+          Thursday: row.Thursday || "",
+          Friday: row.Friday || "",
+          Monday: row.Monday || "",
+          Tuesday: row.Tuesday || "",
+          Wednesday: row.Wednesday || "",
+          Quota: row.Quota || "",
+        },
+      ];
+      const res = await fetch(
+        `${API}/services/save7R?thisWeek=${encodeURIComponent(dailyWeek)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(payload),
+        }
+      );
+      const txt = await res.text();
+      if (res.ok) {
+        setDailyMessage({ type: "success", text: txt || "Saved row" });
+        // Refresh just the table (server returns canonical values)
+        await loadDailyTable(dailyWeek, statsMeta);
+      } else {
+        setDailyMessage({ type: "error", text: txt || "Failed to save row" });
+      }
+    } catch (err) {
+      setDailyMessage({ type: "error", text: String(err) });
+    } finally {
+      setDailyLoading(false);
+    }
+  }
+
+  // Open the weekly modal prefilled from a daily row.
+  // Prefers the canonical weekly value (weeklyValues[statId]) when present,
+  // otherwise falls back to computing the cumulative daily total.
+  function openWeeklyModalFromDaily(row) {
+    if (!row) return;
+    const statId = row.statId || null;
+    if (!statId) return;
+
+    // Try to find metadata for the stat
+    const meta = statsMeta.find((s) => String(s.id) === String(statId)) || {
+      id: statId,
+      short_id: row.short_id,
+      full_name: row.full_name,
+      type: row.type,
+      value_type: "number",
+    };
+
+    // If there is an existing weekly canonical value for this stat/week, use it
+    const canonicalWeekly =
+      weeklyValues && weeklyValues[statId] !== undefined
+        ? weeklyValues[statId]
+        : null;
+
+    let prefillValue = "";
+    const total =
+      (parseFloat(row.Thursday) || 0) +
+      (parseFloat(row.Friday) || 0) +
+      (parseFloat(row.Monday) || 0) +
+      (parseFloat(row.Tuesday) || 0) +
+      (parseFloat(row.Wednesday) || 0);
+
+    const valueType = meta.value_type || meta.valueType || "number";
+    switch (valueType) {
+      case "currency":
+        prefillValue = total.toFixed(2);
+        break;
+      case "percentage":
+        prefillValue = Number(total).toFixed(2);
+        break;
+      case "number":
+      default:
+        prefillValue = String(Math.round(total));
+        break;
+    }
+    // Prefill modal state so the admin can edit/confirm and save via the same modal flow
+    setWeeklyModalStat(meta);
+    setWeeklyModalValue(prefillValue);
+    // If admin editing a personal stat for another user, try to set target user from metadata
+    const assignedUid =
+      meta.user_id ||
+      meta.owner_id ||
+      (Array.isArray(meta.user_ids) && meta.user_ids.length
+        ? meta.user_ids[0]
+        : null) ||
+      null;
+    setWeeklyModalTargetUser(assignedUid);
+
+    // Use the currently-selected dailyWeek as the week to save (modal will send that date)
+    setWeeklyWeek(dailyWeek);
+
+    // Open the existing weekly modal
+    setWeeklyModalOpen(true);
+  }
+
+  // Save the cumulative daily total as the canonical weekly value for the current week
+  // (kept for backward compatibility — the new UX uses modal instead)
+  async function saveWeeklyFromDaily(row) {
+    // legacy path; still works if you prefer direct save without modal
+    if (!row || row.is_calculated) {
+      // allow saving even if is_calculated? per request we'll allow saving, so remove early return
+      // (but keep a guard in case row missing)
+    }
+    const statId = row.statId || null;
+    if (!statId) return;
+
+    // compute cumulative total the same way we display it
+    const total =
+      (parseFloat(row.Thursday) || 0) +
+      (parseFloat(row.Friday) || 0) +
+      (parseFloat(row.Monday) || 0) +
+      (parseFloat(row.Tuesday) || 0) +
+      (parseFloat(row.Wednesday) || 0);
+
+    const meta = statsMeta.find((s) => String(s.id) === String(statId)) || {};
+    const valueType = meta.value_type || meta.valueType || "number";
+
+    let valueStr = "";
+    switch (valueType) {
+      case "currency":
+        valueStr = total.toFixed(2);
+        break;
+      case "percentage":
+        valueStr = Number(total).toFixed(2);
+        break;
+      case "number":
+      default:
+        valueStr = String(Math.round(total));
+        break;
+    }
+
+    setSavingWeeklyIds((prev) => [...prev, String(statId)]);
+    setDailyMessage(null);
+    try {
+      const payload = {
+        stat_id: statId,
+        date: dailyWeek,
+        value: valueStr,
+      };
+
+      const res = await fetch(`${API}/services/logWeeklyStats`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const text = await res.text();
+      let json;
+      if (text) {
+        try {
+          json = JSON.parse(text);
+        } catch {
+          json = { message: text };
+        }
+      }
+
+      if (!res.ok) {
+        const msg =
+          json && json.message ? json.message : text || `HTTP ${res.status}`;
+        setDailyMessage({ type: "error", text: msg });
+      } else {
+        const successMsg =
+          json && json.message ? json.message : "Weekly value saved";
+        setDailyMessage({ type: "success", text: successMsg });
+        // Refresh both weekly values and daily table so UI reflects canonical saved value
+        await loadWeeklyValuesForWeek(weeklyWeek, statsMeta);
+        await loadDailyTable(dailyWeek, statsMeta);
+      }
+    } catch (err) {
+      setDailyMessage({ type: "error", text: String(err) });
+    } finally {
+      setSavingWeeklyIds((prev) =>
+        prev.filter((id) => String(id) !== String(statId))
+      );
+    }
+  }
+
+  // Revert a single row to server copy (discard local edits)
+  async function revertDailyRow(row) {
+    if (!row) return;
+    setDailyLoading(true);
+    try {
+      // Re-load the table (or could fetch single stat)
+      await loadDailyTable(dailyWeek, statsMeta);
+      setDailyMessage({ type: "info", text: "Changes reverted" });
     } catch (err) {
       setDailyMessage({ type: "error", text: String(err) });
     } finally {
@@ -294,7 +504,7 @@ export default function InputStats() {
     setDailyTable((prev) =>
       prev.map((r) =>
         r.statId === todayModalStat.statId
-          ? { ...r, [dayKey]: todayModalValue }
+          ? { ...r, [dayKey]: todayModalValue, dirty: true }
           : r
       )
     );
@@ -585,7 +795,6 @@ export default function InputStats() {
           <Table.Header>
             <Table.Row>
               <Table.HeaderCell>Stat</Table.HeaderCell>
-              <Table.HeaderCell>User</Table.HeaderCell>
               <Table.HeaderCell>Type</Table.HeaderCell>
               <Table.HeaderCell>Thursday</Table.HeaderCell>
               <Table.HeaderCell>Friday</Table.HeaderCell>
@@ -593,7 +802,7 @@ export default function InputStats() {
               <Table.HeaderCell>Tuesday</Table.HeaderCell>
               <Table.HeaderCell>Wednesday</Table.HeaderCell>
               <Table.HeaderCell>Total</Table.HeaderCell>
-              {/* <Table.HeaderCell>Actions</Table.HeaderCell> */}
+              <Table.HeaderCell>Actions</Table.HeaderCell>
             </Table.Row>
           </Table.Header>
           <Table.Body>
@@ -605,18 +814,20 @@ export default function InputStats() {
                 (parseFloat(r.Tuesday) || 0) +
                 (parseFloat(r.Wednesday) || 0);
               return (
-                <Table.Row key={r.statId}>
+                <Table.Row key={r.statId || r.short_id}>
                   <Table.Cell>
-                    <strong>{r.short_id}</strong>
+                    <strong>
+                      {r.short_id} - {r.username.toUpperCase()}
+                    </strong>
                     <div style={{ fontSize: 12, color: "#666" }}>
                       {r.full_name}
                     </div>
                   </Table.Cell>
-                  <Table.Cell>{r.username}</Table.Cell>
+                  {/* <Table.Cell>{r.username}</Table.Cell> */}
                   <Table.Cell>{r.type}</Table.Cell>
                   <Table.Cell>
-                    {r.is_calculated ? ( // <-- Conditional rendering
-                      <span>{r.Thursday || ""}</span> // Read-only: plain text
+                    {r.is_calculated ? (
+                      <span>{r.Thursday || ""}</span>
                     ) : (
                       <Input
                         fluid
@@ -624,7 +835,13 @@ export default function InputStats() {
                         onChange={(e) =>
                           setDailyTable((prev) =>
                             prev.map((x) =>
-                              x === r ? { ...x, Thursday: e.target.value } : x
+                              String(x.statId) === String(r.statId)
+                                ? {
+                                    ...x,
+                                    Thursday: e.target.value,
+                                    dirty: true,
+                                  }
+                                : x
                             )
                           )
                         }
@@ -641,7 +858,9 @@ export default function InputStats() {
                         onChange={(e) =>
                           setDailyTable((prev) =>
                             prev.map((x) =>
-                              x === r ? { ...x, Friday: e.target.value } : x
+                              String(x.statId) === String(r.statId)
+                                ? { ...x, Friday: e.target.value, dirty: true }
+                                : x
                             )
                           )
                         }
@@ -658,7 +877,9 @@ export default function InputStats() {
                         onChange={(e) =>
                           setDailyTable((prev) =>
                             prev.map((x) =>
-                              x === r ? { ...x, Monday: e.target.value } : x
+                              String(x.statId) === String(r.statId)
+                                ? { ...x, Monday: e.target.value, dirty: true }
+                                : x
                             )
                           )
                         }
@@ -675,7 +896,9 @@ export default function InputStats() {
                         onChange={(e) =>
                           setDailyTable((prev) =>
                             prev.map((x) =>
-                              x === r ? { ...x, Tuesday: e.target.value } : x
+                              String(x.statId) === String(r.statId)
+                                ? { ...x, Tuesday: e.target.value, dirty: true }
+                                : x
                             )
                           )
                         }
@@ -692,7 +915,13 @@ export default function InputStats() {
                         onChange={(e) =>
                           setDailyTable((prev) =>
                             prev.map((x) =>
-                              x === r ? { ...x, Wednesday: e.target.value } : x
+                              String(x.statId) === String(r.statId)
+                                ? {
+                                    ...x,
+                                    Wednesday: e.target.value,
+                                    dirty: true,
+                                  }
+                                : x
                             )
                           )
                         }
@@ -700,19 +929,64 @@ export default function InputStats() {
                     )}
                   </Table.Cell>
                   <Table.Cell>{total.toFixed(2)}</Table.Cell>
-                  {/* <Table.Cell>
-                  <Button size="tiny" onClick={() => openTodayModal(r)}>
-                    <Icon name="clock" /> Enter today's
-                  </Button>
-                </Table.Cell> */}
+                  <Table.Cell>
+                    {/* Per-row save & revert to avoid accidental overwrites */}
+                    {!r.is_calculated && (
+                      <>
+                        <Button
+                          size="tiny"
+                          color={r.dirty ? "orange" : undefined}
+                          onClick={() => saveDailyRow(r)}
+                          loading={dailyLoading}
+                        >
+                          <Icon name="save" />
+                          Save Daily
+                        </Button>
+                        {/* <Button
+                          size="tiny"
+                          onClick={() => revertDailyRow(r)}
+                          disabled={!r.dirty}
+                        >
+                          <Icon name="undo" />
+                          Revert
+                        </Button> */}
+                      </>
+                    )}
+
+                    {/* Save Weekly (always available, even for is_calculated rows).
+                        Uses modal prefill so admin can review/edit before saving. */}
+                    <Button
+                      size="tiny"
+                      color="green"
+                      onClick={() => openWeeklyModalFromDaily(r)}
+                      loading={savingWeeklyIds.includes(String(r.statId))}
+                      style={{ marginLeft: 6 }}
+                    >
+                      <Icon name="calendar check" />
+                      Save Weekly
+                    </Button>
+                  </Table.Cell>
                 </Table.Row>
               );
             })}
           </Table.Body>
         </Table>
-        <div style={{ marginTop: 12 }}>
+        <div
+          style={{
+            marginTop: 12,
+            display: "flex",
+            gap: 12,
+            alignItems: "center",
+          }}
+        >
           <Button primary onClick={saveDailyTable} loading={dailyLoading}>
-            Save All
+            Save Modified
+          </Button>
+          <Button
+            onClick={() => loadDailyTable(dailyWeek, statsMeta)}
+            disabled={dailyLoading}
+          >
+            Refresh
           </Button>
           {dailyMessage && (
             <Message
