@@ -966,6 +966,15 @@ export default function InputStats() {
             })}
           </Table.Body>
         </Table>
+        <div>
+          {dailyMessage && (
+            <Message
+              positive={dailyMessage.type === "success"}
+              negative={dailyMessage.type === "error"}
+              content={dailyMessage.text}
+            />
+          )}
+        </div>
         <div
           style={{
             marginTop: 12,
@@ -983,13 +992,6 @@ export default function InputStats() {
           >
             Refresh
           </Button>
-          {dailyMessage && (
-            <Message
-              positive={dailyMessage.type === "success"}
-              negative={dailyMessage.type === "error"}
-              content={dailyMessage.text}
-            />
-          )}
         </div>
       </>
     );
