@@ -1,8 +1,3 @@
-// NOTE: This is the updated InputStats.js with the change so "Save Weekly"
-// is available for every row (including is_calculated). It also updates the
-// helper that opens the weekly modal from a daily row to prefer the existing
-// canonical weekly value (weeklyValues[statId]) when present and fall back to
-// the computed cumulative daily total otherwise.
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Container,
