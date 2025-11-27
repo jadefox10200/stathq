@@ -10,11 +10,15 @@ import {
   Icon,
 } from "semantic-ui-react";
 import ChartLine from "../components/ChartLine";
+import ChartExport from "../components/ChartExport"; // adjust path
+import { useRef } from "react";
 // import StandardChart from "../components/StandardChart";
 
 const API = process.env.REACT_APP_API_URL || "";
 
 export default function ViewStats() {
+  const chartRef = useRef(null);
+
   const [stats, setStats] = useState([]);
   const [users, setUsers] = useState([]);
   const [divisions, setDivisions] = useState([]);
@@ -39,6 +43,9 @@ export default function ViewStats() {
   const [loading, setLoading] = useState(false);
   const [loadingMeta, setLoadingMeta] = useState(true);
   const [error, setError] = useState(null);
+
+  // index of the selected stat within the current filtered list (for prev/next navigation)
+  const [selectedIndex, setSelectedIndex] = useState(-1);
 
   // Load dropdown metadata once on mount (every user may view every stat)
   useEffect(() => {
@@ -92,6 +99,60 @@ export default function ViewStats() {
       mounted = false;
     };
   }, []);
+
+  // Compute the filtered stats list (actual objects) and the dropdown options from it.
+  const filteredStats = useMemo(() => {
+    let filtered = stats || [];
+    if (filterType === "user") {
+      if (selectedUser && selectedUser !== "all") {
+        filtered = filtered.filter((s) => s.user_id === selectedUser);
+      } else {
+        filtered = filtered.filter((s) => s.type === "personal");
+      }
+    } else if (filterType === "division") {
+      filtered = filtered.filter((s) => s.type === "divisional");
+      if (selectedDivision && selectedDivision !== "all") {
+        filtered = filtered.filter((s) => s.division_id === selectedDivision);
+      }
+    }
+    return filtered;
+  }, [stats, filterType, selectedDivision, selectedUser]);
+
+  const statOptions = useMemo(() => {
+    return filteredStats.map((s) => ({
+      key: s.id,
+      text: `${s.short_id} — ${s.full_name} (${s.type || "personal"}) ${
+        s.username ? `: ${s.username}` : ""
+      }`,
+      value: s.id,
+    }));
+  }, [filteredStats]);
+
+  // keep selectedIndex in sync with selectedStatId and filteredStats
+  useEffect(() => {
+    if (!filteredStats || filteredStats.length === 0) {
+      setSelectedIndex(-1);
+      return;
+    }
+    const idx = filteredStats.findIndex(
+      (s) => String(s.id) === String(selectedStatId)
+    );
+    if (idx >= 0) {
+      setSelectedIndex(idx);
+    } else {
+      // If current selection is not in filtered list, default to first item
+      const first = filteredStats[0];
+      if (first) {
+        setSelectedIndex(0);
+        setSelectedStatId(first.id);
+        setSelectedStatMeta(first);
+        // loadData for the new selection
+        loadData({ statId: first.id });
+      } else {
+        setSelectedIndex(-1);
+      }
+    }
+  }, [selectedStatId, filteredStats]);
 
   // loadData: now requests aggregated series from /services/getStatsData
   async function loadData(opts = {}) {
@@ -164,31 +225,22 @@ export default function ViewStats() {
     loadData({ statId: value });
   }
 
-  const statOptions = useMemo(() => {
-    let filteredStats = stats;
-    if (filterType === "user") {
-      if (selectedUser && selectedUser !== "all") {
-        filteredStats = stats.filter((s) => s.user_id === selectedUser);
-      } else {
-        filteredStats = stats.filter((s) => s.type === "personal");
-      }
-    } else if (filterType === "division") {
-      filteredStats = stats.filter((s) => s.type === "divisional");
-      if (selectedDivision && selectedDivision !== "all") {
-        filteredStats = filteredStats.filter(
-          (s) => s.division_id === selectedDivision
-        );
-      }
-    }
-    // For "all", no filter
-    return filteredStats.map((s) => ({
-      key: s.id,
-      text: `${s.short_id} — ${s.full_name} (${s.type || "personal"}) ${
-        s.username ? `: ${s.username}` : ""
-      }`,
-      value: s.id,
-    }));
-  }, [stats, filterType, selectedDivision, selectedUser]);
+  // navigation helpers: select by index in filteredStats
+  function selectByIndex(idx) {
+    if (!filteredStats || idx < 0 || idx >= filteredStats.length) return;
+    const s = filteredStats[idx];
+    setSelectedStatId(s.id);
+    setSelectedStatMeta(s);
+    setSelectedIndex(idx);
+    loadData({ statId: s.id });
+  }
+  function goPrev() {
+    if (selectedIndex > 0) selectByIndex(selectedIndex - 1);
+  }
+  function goNext() {
+    if (selectedIndex < filteredStats.length - 1)
+      selectByIndex(selectedIndex + 1);
+  }
 
   const userOptions = useMemo(
     () => users.map((u) => ({ key: u.id, text: u.username, value: u.id })),
@@ -224,13 +276,51 @@ export default function ViewStats() {
       <Header as="h1" textAlign="center">
         View Stats
       </Header>
-
       <Segment>
         <Grid stackable>
           {/* First row: Choose Stat + Scope/Filter (Refresh moved to the right side of Scope/Filter) */}
           <Grid.Row columns={2}>
             <Grid.Column>
               <label>Choose Stat</label>
+
+              {/* Prev / Next navigation controls */}
+              <div
+                style={{
+                  display: "flex",
+                  gap: 8,
+                  alignItems: "center",
+                  marginBottom: 6,
+                }}
+              >
+                <Button
+                  icon
+                  size="tiny"
+                  onClick={goPrev}
+                  disabled={selectedIndex <= 0 || filteredStats.length === 0}
+                  title="Previous stat"
+                >
+                  <Icon name="chevron left" />
+                </Button>
+                <Button
+                  icon
+                  size="tiny"
+                  onClick={goNext}
+                  disabled={
+                    selectedIndex === -1 ||
+                    selectedIndex >= filteredStats.length - 1 ||
+                    filteredStats.length === 0
+                  }
+                  title="Next stat"
+                >
+                  <Icon name="chevron right" />
+                </Button>
+                <div style={{ color: "#666", fontSize: 12 }}>
+                  {filteredStats && filteredStats.length
+                    ? `${selectedIndex + 1}/${filteredStats.length}`
+                    : "0/0"}
+                </div>
+              </div>
+
               <Dropdown
                 placeholder="Select stat"
                 fluid
@@ -437,9 +527,7 @@ export default function ViewStats() {
           </Grid.Row>
         </Grid>
       </Segment>
-
       {error && <Message negative content={error} />}
-
       <Segment style={{ minHeight: 300 }}>
         {loading ? (
           <Loader active inline="centered" />
@@ -449,14 +537,48 @@ export default function ViewStats() {
             content="No data to display. Choose a stat and click Refresh."
           />
         ) : (
-          <ChartLine
-            data={data}
-            height={360}
-            reversed={selectedStatMeta?.reversed || false}
-          />
+          <div>
+            {/* Chart container — ChartExport will look for the first <svg> inside this ref */}
+            <div ref={chartRef} style={{ width: "100%" }}>
+              <ChartLine
+                data={data}
+                height={360}
+                reversed={selectedStatMeta?.reversed || false}
+              />
+            </div>
+
+            {/* Export / Print buttons — adjust placement as you like */}
+            <div
+              style={{
+                marginTop: 8,
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: 8,
+              }}
+            >
+              {/* Only render when we have a selected stat/meta (filename) and some chart data */}
+              <ChartExport
+                chartRef={chartRef}
+                filename={
+                  selectedStatMeta?.short_id
+                    ? `${selectedStatMeta.short_id}`
+                    : "chart"
+                }
+                title={
+                  selectedStatMeta
+                    ? `${selectedStatMeta.short_id} — ${selectedStatMeta.full_name}`
+                    : ""
+                }
+                subTitle={
+                  selectedStatMeta
+                    ? `${selectedStatMeta.type} - ${selectedStatMeta.username}`
+                    : ""
+                }
+              />
+            </div>
+          </div>
         )}
       </Segment>
-
       {numericSummary && (
         <Segment>
           <strong>Latest:</strong> {numericSummary.last} &nbsp;
